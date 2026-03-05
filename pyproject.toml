@@ -1,0 +1,20 @@
+[project]
+name = "curvytron-rl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gymnasium>=1.2.3",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.2",
+    "pandas>=3.0.1",
+    "scikit-image>=0.26.0",
+    "scikit-learn>=1.8.0",
+    "websocket-client>=1.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+]
