@@ -1,7 +1,2 @@
-.spyproject/*
-*.zip
-*.pyc
-.idea/*
-curvytron-master/*
-curvytron-step-by-step/*
-*.pcapng
+__pycache__
+.history
