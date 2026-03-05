@@ -1,17 +1,14 @@
-# curvytron-client
+# curvytron-rl
 
+This repository contains code for a local curvytron client which interacts with a
+curvytron server (either locally hosted or the official one), and an environment
+interface for reinforcement learning agents.
 
-client.py contains code to interact with the curvtron server.
-env.py is an interface around this that is compatible with the gym environments.
-
-***
 
 ## Install
 
 ```bash
-conda create -n cc python=3 spyder scikit-image
-conda activate cc
-pip install websocket-client
+uv sync
 ```
 
 ***
@@ -21,17 +18,22 @@ To see the environment drawing the players, run the following in a python script
 import curvytron
 import matplotlib.pyplot as plt
 serveraddress = "127.0.0.1:8080"  # if you're running a local server
-# serveraddress = "www.curvytron.com"  # if you want to run on the game website
-env = curvytron.CurvytronEnv(server=serveraddress,room='room')
+# serveraddress = "curvytron.com"  # if you want to run on the game website
+env = curvytron.CurvytronEnv(
+    server=serveraddress,
+    room='room',
+    name='random_boi',
+    color='#ff0090'
+    )
 env.reset()
 episode_over = False
 while not episode_over:
-    ob,r,episode_over = environment.step(2)
+    ob, r, episode_over = env.step(2)
     plt.imshow(ob.pixels)
     plt.pause(0.005)
-print "done"
+print("done")
 ```
-***
+
 ## TODO
 
 * adapt client for step-by-step version of curvytron
