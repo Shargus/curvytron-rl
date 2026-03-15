@@ -12,24 +12,35 @@ from curvytron import CurvytronEnv
 class Agent(threading.Thread):
     def __init__(self, name, server, room, **kwargs):
         super(Agent, self).__init__()
+
+        # Create the environment for the agent to interact with
         self.env = CurvytronEnv(
             server,
             room,
             name=name,
-            color="#%06x" % random.randint(0, 0xFFFFFF),
+            color=f"#{random.randint(0, 0xFFFFFF):06x}",
             **kwargs
             )
 
     def run(self):
         while True:
+            # Reset the environment and get the initial state
             state = self.env.reset()
             episode_over = False
             while not episode_over:
+                # Get the action to take in the environment given the current state
                 action = self.action(state)
+                # Take the action and get the new state, reward, and whether the episode is over
                 state, reward, episode_over = self.env.step(action)
 
     def extract_patch(self, state, patch_size=30, thresh=0.1):
         """
+        Extracts a patch of the canvas around the player and rotates it to be oriented
+        in the direction of the player.
+        The patch is then thresholded to be a binary image.
+        The patch is of size (patch_size, patch_size) and is centered around the player.
+        If patch_size is odd, the player is in the center of the patch.
+
         If patch_size is even, define 'central' position of the patch to be the
         south west square and get i.e. for patch of size (10, 10) state.pos 
         will be at point (5, 4). If s is even, there is a central square e.g.
@@ -59,4 +70,13 @@ class Agent(threading.Thread):
         return patch > thresh
 
     def action(self, state):
+        """
+        Returns an action to take in the environment given the current state.
+
+        Args:
+            state (tuple): canvas, position, angle
+
+        Returns:
+            action (int in [0, 1, 2]): action to submit (left, straight, right)
+        """
         raise NotImplementedError()
