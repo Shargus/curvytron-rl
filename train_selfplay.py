@@ -59,6 +59,9 @@ def parse_args():
     p.add_argument('--epochs', type=int, default=3)
     p.add_argument('--minibatch', type=int, default=8192)
     p.add_argument('--max-grad-norm', type=float, default=0.5)
+    p.add_argument('--rollout-on-cpu', action='store_true',
+                   help='keep the rollout in CPU RAM and send it per minibatch: slower updates, but GPU '
+                        'memory then depends on the minibatch size only (for GPUs with ~20 GB)')
     p.add_argument('--hidden', default='512,512,256')
     p.add_argument('--p-self', type=float, default=0.6)
     p.add_argument('--p-heuristic', type=float, default=0.1)
@@ -456,9 +459,12 @@ def main():
             next_val = np.where(v, buf_val[t], next_val)
             adv[t] = np.where(v, g, 0.0)
         valid = buf_valid.reshape(-1)
-        b_obs = torch.from_numpy(np.concatenate(buf_obs)).to(device)
-        b_map = torch.from_numpy(np.concatenate(buf_map)).to(device) if M > 0 else None
-        b_gmap = torch.from_numpy(np.concatenate(buf_gmap)).to(device) if args.global_map else None
+        # with --rollout-on-cpu the large inputs stay in CPU RAM and are sent per minibatch,
+        # so GPU memory depends on the minibatch size only
+        big_dev = torch.device('cpu') if args.rollout_on_cpu else device
+        b_obs = torch.from_numpy(np.concatenate(buf_obs)).to(big_dev)
+        b_map = torch.from_numpy(np.concatenate(buf_map)).to(big_dev) if M > 0 else None
+        b_gmap = torch.from_numpy(np.concatenate(buf_gmap)).to(big_dev) if args.global_map else None
         b_act = torch.from_numpy(buf_act.reshape(-1)[valid]).to(device)
         b_logp = torch.from_numpy(buf_logp.reshape(-1)[valid]).to(device)
         b_adv = torch.from_numpy(adv.reshape(-1)[valid]).to(device)
@@ -473,11 +479,13 @@ def main():
         model.train()
         clipfracs, pg_losses, v_losses, ents, kls = [], [], [], [], []
         for _ in range(args.epochs):
-            perm = torch.randperm(N, device=device)
+            perm = torch.randperm(N)
             for s in range(0, N, args.minibatch):
-                idx = perm[s:s + args.minibatch]
-                logits, value = model(b_obs[idx], b_map[idx] if M > 0 else None,
-                                      b_gmap[idx] if args.global_map else None)
+                big_idx = perm[s:s + args.minibatch].to(big_dev)
+                idx = big_idx.to(device)
+                logits, value = model(b_obs[big_idx].to(device, non_blocking=True),
+                                      b_map[big_idx].to(device, non_blocking=True) if M > 0 else None,
+                                      b_gmap[big_idx].to(device, non_blocking=True) if args.global_map else None)
                 dist = torch.distributions.Categorical(logits=logits)
                 logp = dist.log_prob(b_act[idx])
                 ratio = (logp - b_logp[idx]).exp()
@@ -610,8 +618,10 @@ def main():
     save_policy(os.path.join(run_dir, 'model_final.pt'), model,
                 {'steps': total_steps, 'update': update, 'args': vars(args)})
     log('=' * 100)
-    log(f"done: {fmt_num(total_steps)} steps in {fmt_time(time.time() - t_start)}, best evaluation score "
-        f"{best_score:+.3f} -> {run_dir}/model_best.pt, last model {run_dir}/model_final.pt")
+    best = (f"best evaluation score {best_score:+.3f} -> {run_dir}/model_best.pt"
+            if np.isfinite(best_score) else 'no evaluation ran')
+    log(f"done: {fmt_num(total_steps)} steps in {fmt_time(time.time() - t_start)}, {best}, "
+        f"last model {run_dir}/model_final.pt")
     writer.close()
 
 

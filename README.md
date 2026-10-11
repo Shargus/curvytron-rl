@@ -118,6 +118,13 @@ uv run python train_selfplay.py --run-name cpu --device cpu --hidden 256,256 --n
 tensorboard --logdir runs
 ```
 
+GPU memory: with both maps, the rollout (~5-8 GB with 1024 envs) is kept on the GPU
+and a 32768 minibatch needs ~20-25 GB of activations, so the command above needs a
+large GPU (40-80 GB). On a ~20 GB GPU add `--rollout-on-cpu --minibatch 8192`: the
+rollout then stays in RAM and only minibatches are sent to the GPU (~7 GB), at the
+cost of slower updates. The progress log shows how the time splits between
+simulating and learning.
+
 Set `--threads` to about the number of physical cores (it drives both torch and
 the numba simulator). The first start compiles the simulator (~1-2 minutes, then cached).
 Memory is about 2 MB per environment, plus the rollout (~6 GB with both maps
