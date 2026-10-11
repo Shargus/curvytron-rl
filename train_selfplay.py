@@ -45,6 +45,11 @@ def parse_args():
     p.add_argument('--bonus-modes', default='0.3,0.4,0.3', help='P(no bonus), P(all), P(random subset)')
     p.add_argument('--frame-skip', type=int, default=3, help='server frames per decision (3 = 50 ms)')
     p.add_argument('--delay', default='0,8', help='round-trip latency range in frames (1 frame = 16.7 ms)')
+    p.add_argument('--kill-reward', default='0,0.6',
+                   help='range of the per-kill bonus ("aggression"), sampled per player and round and '
+                        'observed by the bot, so the play style can be chosen when playing')
+    p.add_argument('--eval-aggression', type=float, default=0.2,
+                   help='aggression the bot is given in evaluations and videos')
     p.add_argument('--map-size', type=int, default=0, help='egocentric map cells per side (0 = no CNN)')
     p.add_argument('--global-map', action='store_true', help='add the whole-board map (CNN input)')
     p.add_argument('--total-steps', type=float, default=2e8, help='learner transitions')
@@ -101,10 +106,11 @@ def policy_moves(model, env, sel, greedy=False):
 
 @torch.no_grad()
 def evaluate(model, opponent, rounds, seed, n_players=2, bonus_modes=(0.3, 0.4, 0.3), num_envs=128,
-             delay=(0, 8), frame_skip=3):
+             delay=(0, 8), frame_skip=3, aggression=0.2):
     """Results of ``model`` (one random slot) vs ``opponent`` (all other slots).
 
-    opponent: an ActorCritic or the string 'heuristic'. Returns (mean return, win rate).
+    opponent: an ActorCritic or the string 'heuristic'. Returns (mean return, win rate), both
+    from placement only (the kill bonus is not counted). Every player gets ``aggression``.
     """
     probs = [0.0] * (n_players - 1)
     probs[-1] = 1.0
@@ -112,7 +118,7 @@ def evaluate(model, opponent, rounds, seed, n_players=2, bonus_modes=(0.3, 0.4, 
     global_map = model.global_map or getattr(opponent, 'global_map', False)
     env = BatchEnv(num_envs, max_players=n_players, n_probs=probs, bonus_modes=bonus_modes,
                    seed=seed, map_size=map_size, global_map=global_map, delay=delay,
-                   frame_skip=frame_skip)
+                   frame_skip=frame_skip, kill_reward=(aggression, aggression))
     env.reset()
     ret = np.zeros(num_envs)
     results = []
@@ -142,18 +148,21 @@ def evaluate(model, opponent, rounds, seed, n_players=2, bonus_modes=(0.3, 0.4, 
 
 
 @torch.no_grad()
-def record_video(model, n_players, opponent, seed, frame_skip, delay, size_px=240, stride=2, max_seconds=90):
+def record_video(model, n_players, opponent, seed, frame_skip, delay, size_px=240, stride=2, max_seconds=90,
+                 aggression=0.2):
     """Play one round (all bonuses on) and return (frames, info). The model controls a random
     slot, drawn with a white ring; the others are the model too ('self') or the heuristic."""
     probs = [0.0] * (n_players - 1)
     probs[-1] = 1.0
     env = BatchEnv(1, max_players=n_players, n_probs=probs, bonus_modes=(0, 1, 0), seed=seed,
-                   map_size=model.map_size, global_map=model.global_map, delay=delay, frame_skip=frame_skip)
+                   map_size=model.map_size, global_map=model.global_map, delay=delay, frame_skip=frame_skip,
+                   kill_reward=(aggression, aggression))
     env.reset()
     me = np.random.default_rng(seed).integers(0, n_players)
     slots = np.arange(n_players)[None, :]
     frames = [render(env.S, 0, size_px, me)]
     ret = 0.0
+    kills = 0
     step = 0
     max_steps = int(max_seconds * 60 / frame_skip)
     while step < max_steps:
@@ -168,6 +177,7 @@ def record_video(model, n_players, opponent, seed, frame_skip, delay, size_px=24
             actions[others] = env.heuristic(others)[others]
         _, rew, done, reset = env.step(actions)
         ret += rew[0, me]
+        kills += env.kills[0, me]
         step += 1
         if reset[0]:
             break
@@ -175,7 +185,8 @@ def record_video(model, n_players, opponent, seed, frame_skip, delay, size_px=24
             frames.append(render(env.S, 0, size_px, me))
     frames += [frames[-1]] * 10   # hold the last frame for a moment
     placement = int(round((ret + 1) / 2 * (n_players - 1)))   # points: 0 = first out, n-1 = survivor
-    info = {'seconds': step * frame_skip / 60, 'rank': n_players - placement, 'fps': 60 / (frame_skip * stride)}
+    info = {'seconds': step * frame_skip / 60, 'rank': n_players - placement, 'fps': 60 / (frame_skip * stride),
+            'kills': int(kills)}
     return frames, info
 
 
@@ -278,6 +289,12 @@ def episode_report(episodes, frame_skip):
     if len(died):
         lines.append(f"  deaths   wall {np.mean(died == 0) * 100:4.1f}% | own trail {np.mean(died == 1) * 100:4.1f}% | "
                      f"others' trails {np.mean(died == 2) * 100:4.1f}%   (of {len(died)} deaths)")
+    k = arr('kills')
+    a = arr('aggr')
+    if len(k):
+        lo, hi = (a <= np.median(a)), (a > np.median(a))
+        lines.append(f"  kills    {np.mean(k):.2f} per round (opponents crashing into the bot's trail) | "
+                     f"low aggression {np.mean(k[lo]):.2f} vs high {np.mean(k[hi]) if hi.any() else float('nan'):.2f}")
     return lines
 
 
@@ -307,9 +324,10 @@ def main():
     n_probs = n_probs[: args.max_players - 1]
     bonus_modes = [float(v) for v in args.bonus_modes.split(',')]
     delay = tuple(int(v) for v in args.delay.split(','))
+    kill_reward = tuple(float(v) for v in args.kill_reward.split(','))
     env = BatchEnv(args.num_envs, max_players=args.max_players, n_probs=n_probs,
-                   bonus_modes=bonus_modes, frame_skip=args.frame_skip,
-                   delay=delay, seed=args.seed, map_size=args.map_size, global_map=args.global_map)
+                   bonus_modes=bonus_modes, frame_skip=args.frame_skip, delay=delay, kill_reward=kill_reward,
+                   seed=args.seed, map_size=args.map_size, global_map=args.global_map)
     E, P, T, M = env.E, env.P, args.rollout, args.map_size
 
     pool = OpponentPool(args.pool_size, args.active_opponents, make_model)
@@ -346,6 +364,8 @@ def main():
         f" | local map {f'{M}x{M}' if M else 'off'} | whole-board map {'on' if args.global_map else 'off'}")
     log(f"  envs        {E} parallel rounds, 2-{P} players, decision every {args.frame_skip} frames "
         f"({args.frame_skip * 1000 / 60:.0f} ms), latency {delay[0]}-{delay[1]} frames")
+    log(f"  reward      placement (+1 survivor ... -1 first out) + kill bonus {kill_reward[0]}-{kill_reward[1]} "
+        f"per kill (sampled per player, observed); evaluations use aggression {args.eval_aggression}")
     log(f"  opponents   self {args.p_self:.0%} | heuristic {args.p_heuristic:.0%} | "
         f"pool {max(0.0, 1 - args.p_self - args.p_heuristic):.0%} (snapshot every {args.snapshot_every} updates)")
     log(f"  ppo         rollout {T} | gamma {args.gamma} | lambda {args.lam} | lr {args.lr} | "
@@ -373,6 +393,7 @@ def main():
 
     ep_ret = np.zeros((E, P))
     ep_len = np.zeros((E, P))
+    ep_kills = np.zeros((E, P))
     episodes = deque(maxlen=5000)   # recent learner rounds, for logs
     rounds_done = 0
     ppo_hist = deque(maxlen=20)     # recent per-update PPO diagnostics
@@ -427,16 +448,20 @@ def main():
                 sel = others & (ctrl[:, None] == k)
                 if sel.any():
                     actions[sel] = policy_moves(m, env, sel)
+            aggr = env.S.aggr.copy()   # this round's aggression (env may reset during step)
             _, rew, done, reset = env.step(actions)
-            buf_rew[t] = rew
+            buf_rew[t] = rew + env.kill_rew   # learn from placement + kill bonus
             buf_done[t] = done
-            # episode stats for learner agents
+            # episode stats for learner agents (placement only, plus kill counts)
             ep_ret += np.where(learner, rew, 0.0)
             ep_len += learner
+            ep_kills += np.where(learner, env.kills, 0)
             for e, p in zip(*np.nonzero(done & learner)):
                 c = int(ctrl[e])
                 episodes.append({'ctrl': c, 'ret': ep_ret[e, p], 'len': ep_len[e, p],
-                                 'n': int(n_round[e]), 'cause': int(env.cause[e, p])})
+                                 'n': int(n_round[e]), 'cause': int(env.cause[e, p]),
+                                 'kills': ep_kills[e, p], 'aggr': aggr[e, p]})
+                ep_kills[e, p] = 0.0
                 if c >= 0:
                     pool.record(c, (ep_ret[e, p] + 1.0) / 2.0)   # placement in [0, 1]
                 ep_ret[e, p] = 0.0
@@ -581,13 +606,13 @@ def main():
             for n_eval in (2, 4, 8):
                 ev[f'ret_heur_{n_eval}p'], ev[f'win_heur_{n_eval}p'] = evaluate(
                     model, 'heuristic', args.eval_rounds, seed=update + n_eval, n_players=n_eval, delay=delay,
-                    frame_skip=args.frame_skip)
+                    frame_skip=args.frame_skip, aggression=args.eval_aggression)
             ref = make_model()
             ref.load_state_dict(pool.entries[max(0, len(pool.entries) - 9)]['state'])
             ref.eval()
             ev['ret_past_6p'], ev['win_past_6p'] = evaluate(
                 model, ref, args.eval_rounds, seed=update + 1, n_players=6, delay=delay,
-                frame_skip=args.frame_skip)
+                frame_skip=args.frame_skip, aggression=args.eval_aggression)
             # one number to track: mean round return vs the heuristic over 2, 4 and 8 players
             ev['score'] = float(np.mean([ev[f'ret_heur_{n}p'] for n in (2, 4, 8)]))
             for k, v in ev.items():
@@ -617,7 +642,7 @@ def main():
         if video_every and update % video_every == 0:
             model.eval()
             frames, info = record_video(model, args.video_players, args.video_opponent, seed=update,
-                                        frame_skip=args.frame_skip, delay=delay)
+                                        frame_skip=args.frame_skip, delay=delay, aggression=args.eval_aggression)
             gif = encode_gif(frames, info['fps'])
             path = os.path.join(run_dir, 'videos', f'round_{update:05d}.gif')
             with open(path, 'wb') as f:
@@ -628,6 +653,7 @@ def main():
                 Summary(value=[Summary.Value(tag='video/sample_round', image=img)]), total_steps)
             log(f"  video    {path}: {args.video_players} players (others: {args.video_opponent}), bot ringed "
                 f"in white finished #{info['rank']} of {args.video_players} after {info['seconds']:.0f}s "
+                f"with {info['kills']} kill(s) "
                 f"| tensorboard: Images tab, video/sample_round")
 
     save_policy(os.path.join(run_dir, 'model_final.pt'), model,

@@ -43,7 +43,7 @@ def _sample_config(n_cdf, bonus_mode_cdf, bonus_p, enabled):
 
 
 @nb.njit(cache=True)
-def _new_round(S, e, n_cdf, bonus_mode_cdf, bonus_p, delay_lo, delay_hi, prev_ps, P):
+def _new_round(S, e, n_cdf, bonus_mode_cdf, bonus_p, delay_lo, delay_hi, kill_lo, kill_hi, prev_ps, P):
     enabled = np.zeros(NB, np.bool_)
     n = min(_sample_config(n_cdf, bonus_mode_cdf, bonus_p, enabled), P)
     reset_env(S, e, n, enabled)
@@ -51,18 +51,20 @@ def _new_round(S, e, n_cdf, bonus_mode_cdf, bonus_p, delay_lo, delay_hi, prev_ps
         prev_ps[e, p] = 0.0
         # every player has its own network latency (round trip, in frames)
         S.delay[e, p] = np.random.randint(delay_lo, delay_hi + 1)
+        # aggression: this player's bonus for each opponent killed on its trail (also observed)
+        S.aggr[e, p] = kill_lo + np.random.random() * (kill_hi - kill_lo)
 
 
 @nb.njit(parallel=True, cache=True)
-def _reset_all(S, n_cdf, bonus_mode_cdf, bonus_p, delay_lo, delay_hi, prev_ps, P):
+def _reset_all(S, n_cdf, bonus_mode_cdf, bonus_p, delay_lo, delay_hi, kill_lo, kill_hi, prev_ps, P):
     E = S.size.shape[0]
     for e in nb.prange(E):
-        _new_round(S, e, n_cdf, bonus_mode_cdf, bonus_p, delay_lo, delay_hi, prev_ps, P)
+        _new_round(S, e, n_cdf, bonus_mode_cdf, bonus_p, delay_lo, delay_hi, kill_lo, kill_hi, prev_ps, P)
 
 
 @nb.njit(parallel=True, cache=True)
-def _step_all(S, actions, frame_skip, delay_lo, delay_hi, jitter, max_t, n_cdf, bonus_mode_cdf, bonus_p,
-              prev_ps, rew, done, cause, reset_flag, P):
+def _step_all(S, actions, frame_skip, delay_lo, delay_hi, kill_lo, kill_hi, jitter, max_t, n_cdf,
+              bonus_mode_cdf, bonus_p, prev_ps, rew, kill_rew, kills, done, cause, reset_flag, P):
     E = S.size.shape[0]
     for e in nb.prange(E):
         n = S.n[e]
@@ -86,6 +88,15 @@ def _step_all(S, actions, frame_skip, delay_lo, delay_hi, jitter, max_t, n_cdf, 
                     S.score[e, p] = S.deaths[e]
         scale = 2.0 / max(n - 1, 1)
         for p in range(P):
+            kill_rew[e, p] = 0.0
+            kills[e, p] = 0
+        for p in range(n):   # kill bonus to the owner of the trail hit, if still in its round
+            if alive0[p] and not S.alive[e, p]:
+                q = S.killer[e, p]
+                if q >= 0 and q != p and alive0[q]:
+                    kill_rew[e, q] += S.aggr[e, q]
+                    kills[e, q] += 1
+        for p in range(P):
             rew[e, p] = 0.0
             done[e, p] = False
             cause[e, p] = -1
@@ -99,7 +110,7 @@ def _step_all(S, actions, frame_skip, delay_lo, delay_hi, jitter, max_t, n_cdf, 
                     rew[e, p] -= 1.0
         reset_flag[e] = S.over[e]
         if S.over[e]:
-            _new_round(S, e, n_cdf, bonus_mode_cdf, bonus_p, delay_lo, delay_hi, prev_ps, P)
+            _new_round(S, e, n_cdf, bonus_mode_cdf, bonus_p, delay_lo, delay_hi, kill_lo, kill_hi, prev_ps, P)
 
 
 class BatchEnv:
@@ -113,6 +124,8 @@ class BatchEnv:
         frame_skip: server frames (1/60 s) per decision.
         delay: (lo, hi) round-trip latency in frames, sampled per player and round. A move
             chosen from the current state reaches the server that many frames later.
+        kill_reward: (lo, hi) range of the per-kill bonus ("aggression"), sampled per player
+            and round and observed by that player. Paid separately in ``self.kill_rew``.
         jitter_ms: uniform jitter on the frame duration (the server uses wall-clock steps).
         map_size: if > 0, also build an egocentric occupancy map of map_size x map_size cells
             (``self.maps``, uint8 [E, P, MAP_CHANNELS, M, M]) for a CNN policy.
@@ -121,7 +134,7 @@ class BatchEnv:
     """
 
     def __init__(self, num_envs, max_players=12, n_probs=None, bonus_modes=(0.3, 0.4, 0.3),
-                 bonus_p=0.5, frame_skip=2, delay=(0, 8), jitter_ms=1.0, max_round_s=150.0, seed=0,
+                 bonus_p=0.5, frame_skip=2, delay=(0, 8), kill_reward=(0.0, 0.6), jitter_ms=1.0, max_round_s=150.0, seed=0,
                  map_size=0, global_map=False):
         assert 2 <= max_players <= MAX_PLAYERS
         self.E = num_envs
@@ -139,12 +152,15 @@ class BatchEnv:
         self.frame_skip = int(frame_skip)
         self.delay_lo, self.delay_hi = int(delay[0]), int(delay[1])
         assert 0 <= self.delay_lo <= self.delay_hi < core.RING - 2
+        self.kill_lo, self.kill_hi = float(kill_reward[0]), float(kill_reward[1])
         self.jitter = float(jitter_ms)
         self.max_t = float(max_round_s) * 1000.0
         self.S = make_state(num_envs, max_players)
         self.prev_ps = np.zeros((num_envs, max_players))
         self.rew = np.zeros((num_envs, max_players), np.float32)
         self.done = np.zeros((num_envs, max_players), np.bool_)
+        self.kill_rew = np.zeros((num_envs, max_players), np.float32)   # kill bonus earned this step
+        self.kills = np.zeros((num_envs, max_players), np.int32)        # kills made this step
         self.cause = np.full((num_envs, max_players), -1, np.int8)   # death cause of agents done this step
         self.reset_flag = np.zeros(num_envs, np.bool_)
         self.obs = np.zeros((num_envs, max_players, OBS_DIM), np.float32)
@@ -163,7 +179,7 @@ class BatchEnv:
 
     def reset(self):
         _reset_all(self.S, self.n_cdf, self.bonus_mode_cdf, self.bonus_p, self.delay_lo, self.delay_hi,
-                   self.prev_ps, self.P)
+                   self.kill_lo, self.kill_hi, self.prev_ps, self.P)
         return self.observe()
 
     def observe(self):
@@ -176,11 +192,13 @@ class BatchEnv:
         return self.obs
 
     def step(self, actions):
-        """actions: int array [E, P] of moves in {-1, 0, 1}. Returns (obs, rew, done, reset_flag)."""
+        """actions: int array [E, P] of moves in {-1, 0, 1}. Returns (obs, rew, done, reset_flag).
+
+        ``rew`` is the placement reward only; the kill bonus of the same step is in ``self.kill_rew``."""
         actions = np.ascontiguousarray(actions, dtype=np.int64)
-        _step_all(self.S, actions, self.frame_skip, self.delay_lo, self.delay_hi, self.jitter, self.max_t,
-                  self.n_cdf, self.bonus_mode_cdf, self.bonus_p, self.prev_ps,
-                  self.rew, self.done, self.cause, self.reset_flag, self.P)
+        _step_all(self.S, actions, self.frame_skip, self.delay_lo, self.delay_hi, self.kill_lo, self.kill_hi,
+                  self.jitter, self.max_t, self.n_cdf, self.bonus_mode_cdf, self.bonus_p, self.prev_ps,
+                  self.rew, self.kill_rew, self.kills, self.done, self.cause, self.reset_flag, self.P)
         return self.observe(), self.rew, self.done, self.reset_flag
 
     def heuristic(self, mask, eps=0.3):

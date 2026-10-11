@@ -10,6 +10,7 @@ dependencies = [
     "numba>=0.68.0",
     "numpy>=2.4.2",
     "pandas>=3.0.1",
+    "prompt-toolkit>=3.0.52",
     "scikit-image>=0.26.0",
     "scikit-learn>=1.8.0",
     "tensorboard>=2.20.0",

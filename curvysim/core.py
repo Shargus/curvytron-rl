@@ -76,7 +76,8 @@ SimState = namedtuple('SimState', [
     # per player
     'x', 'y', 'ang', 'vel', 'rad', 'inv', 'invinc', 'straight', 'turn', 'move',
     'alive', 'printing', 'tl_x', 'tl_y', 'has_tl', 'bc',
-    'pm_active', 'pm_dist', 'pm_lx', 'pm_ly', 'since_toggle', 'score', 'death_t', 'cause',
+    'pm_active', 'pm_dist', 'pm_lx', 'pm_ly', 'since_toggle', 'score', 'death_t', 'cause', 'killer',
+    'aggr',
     # trail bodies
     'px', 'py', 'pr', 'pown', 'pnum',
     'hcnt', 'hidx', 'raster', 'gown',
@@ -101,7 +102,8 @@ def make_state(E, P=MAX_PLAYERS):
         tl_x=z((E, P), f64), tl_y=z((E, P), f64), has_tl=z((E, P), b), bc=z((E, P), i32),
         pm_active=z((E, P), b), pm_dist=z((E, P), f64), pm_lx=z((E, P), f64),
         pm_ly=z((E, P), f64), since_toggle=z((E, P), f64), score=z((E, P), f64),
-        death_t=z((E, P), f64), cause=np.full((E, P), -1, i8),
+        death_t=z((E, P), f64), cause=np.full((E, P), -1, i8), killer=np.full((E, P), -1, i8),
+        aggr=z((E, P), f64),
         px=z((E, MAX_POINTS), f64), py=z((E, MAX_POINTS), f64), pr=z((E, MAX_POINTS), f64),
         pown=z((E, MAX_POINTS), i8), pnum=z((E, MAX_POINTS), i32),
         hcnt=z((E, HASH_G, HASH_G), i32), hidx=z((E, HASH_G, HASH_G, HASH_CAP), i32),
@@ -314,9 +316,10 @@ CAUSE_WALL, CAUSE_OWN, CAUSE_OTHER = 0, 1, 2
 
 
 @nb.njit(cache=True)
-def kill(S, e, p, score, cause):
+def kill(S, e, p, score, cause, killer):
     S.alive[e, p] = False
     S.cause[e, p] = cause
+    S.killer[e, p] = killer   # owner of the trail that was hit (-1 for walls)
     S.score[e, p] = score
     S.death_t[e, p] = S.t[e]
     S.deaths[e] += 1
@@ -540,6 +543,7 @@ def reset_env(S, e, n, enabled):
         S.score[e, p] = 0.0
         S.death_t[e, p] = 0.0
         S.cause[e, p] = -1
+        S.killer[e, p] = -1
         for k in range(RING):
             S.sched[e, p, k] = NO_MOVE
         for k in range(HIST):
@@ -632,12 +636,12 @@ def step_frame(S, e, dt):
                 else:
                     S.y[e, p] = 0.0
             else:
-                kill(S, e, p, score, CAUSE_WALL)
+                kill(S, e, p, score, CAUSE_WALL, -1)
                 death = True
         elif not S.invinc[e, p]:
             k = query_body(S, e, x, y, r, p, num_ref)
             if k >= 0:
-                kill(S, e, p, score, CAUSE_OWN if S.pown[e, k] == p else CAUSE_OTHER)
+                kill(S, e, p, score, CAUSE_OWN if S.pown[e, k] == p else CAUSE_OTHER, S.pown[e, k])
                 death = True
         if S.alive[e, p]:
             pm_test(S, e, p)

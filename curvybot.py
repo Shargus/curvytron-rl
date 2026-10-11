@@ -219,9 +219,10 @@ class Mirror:
 
 
 class CurvyBot(client.CurvytronClient):
-    def __init__(self, model, decide_every=2, greedy=False, **kwargs):
+    def __init__(self, model, decide_every=2, greedy=False, aggression=0.2, **kwargs):
         super().__init__(**kwargs)
         self.model = model
+        self.aggression = aggression   # kill bonus the policy plays for (0 = pure survival)
         self.decide_every = decide_every
         self.greedy = greedy
         self.mirror = Mirror()
@@ -240,6 +241,22 @@ class CurvyBot(client.CurvytronClient):
         self.extra_delay_ms = 0.0   # processing / decision-interval allowance
         self.sent = deque(maxlen=64)
         self.decisions = deque(maxlen=HIST)
+
+    def warmup(self):
+        """Compile the numba observation code before the game starts (first call takes ~1 min)."""
+        warm = Mirror()
+        warm.new_game([0, 1], 0)
+        warm.new_round()
+        warm.set_latency(0, 50.0, [], [])
+        write_obs(warm.S, 0, 0, self.obs)
+        if self.map is not None:
+            write_map(warm.S, 0, 0, self.map)
+        if self.gmap is not None:
+            write_global(warm.S, 0, 0, self.gmap)
+        with torch.no_grad():
+            self.model.act(torch.from_numpy(self.obs)[None],
+                           None if self.map is None else torch.from_numpy(self.map)[None],
+                           None if self.gmap is None else torch.from_numpy(self.gmap)[None])
 
     def run(self):
         try:
@@ -307,6 +324,7 @@ class CurvyBot(client.CurvytronClient):
             return
         S.t[0] = self.mirror.now()
         self.mirror.set_latency(p, self.rtt_ms + self.extra_delay_ms, self.sent, self.decisions)
+        S.aggr[0, p] = self.aggression
         write_obs(S, 0, p, self.obs)
         maps = None
         if self.map is not None:
@@ -338,6 +356,8 @@ def main():
     ap.add_argument('--decide-every', type=int, default=None,
                     help='server frames per decision (default: the frame skip used in training)')
     ap.add_argument('--greedy', action='store_true', help='argmax actions instead of sampling')
+    ap.add_argument('--aggression', type=float, default=0.2,
+                    help='hunting vs surviving: kill bonus the bot plays for (trained range, default 0-0.6)')
     ap.add_argument('--games', type=int, default=1, help='games to play before exiting (0 = forever)')
     ap.add_argument('--wait-players', type=int, default=2,
                     help='only get ready once the room has this many players')
@@ -346,18 +366,9 @@ def main():
     torch.set_num_threads(1)
     model, ckpt = load_policy(args.model)
     decide_every = args.decide_every or ckpt.get('args', {}).get('frame_skip', 3)
-    bot = CurvyBot(model, decide_every=decide_every, greedy=args.greedy,
+    bot = CurvyBot(model, decide_every=decide_every, greedy=args.greedy, aggression=args.aggression,
                    name=args.name, color=args.color)
-    # compile the numba observation code before the game starts (first call takes ~1 min)
-    warm = Mirror()
-    warm.new_game([0, 1], 0)
-    warm.new_round()
-    warm.set_latency(0, 50.0, [], [])
-    write_obs(warm.S, 0, 0, bot.obs)
-    if bot.map is not None:
-        write_map(warm.S, 0, 0, bot.map)
-    if bot.gmap is not None:
-        write_global(warm.S, 0, 0, bot.gmap)
+    bot.warmup()
     bot.start()
     bot.connect_to_server(args.server)
     time.sleep(1)

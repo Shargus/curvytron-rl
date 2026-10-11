@@ -107,6 +107,16 @@ more). The reward follows Curvytron scoring: an avatar dying k-th gets k points,
 the survivor n-1, and the return of a round is `2 * points / (n - 1) - 1`
 (+1 for the survivor, -1 for the first out).
 
+On top of that, a player whose trail kills an opponent gets a kill bonus
+("aggression", hunting vs surviving). Each player draws its own bonus per round
+from `--kill-reward` (default 0-0.6) and sees it as an input, so a single trained
+model learns the whole range of play styles and you choose one when playing
+(`--aggression`, default 0.2, which favours surviving; 0 = survive only). For scale:
+a duel is worth +-1, and in a 10-player round every opponent death already gives
+each survivor +0.22. Evaluations and logged returns measure placement only (at
+aggression `--eval-aggression`, default 0.2); the progress log also shows kills
+per round, split by low and high aggression.
+
 ```bash
 # GPU server (recommended): CNN over the egocentric map, larger network
 uv run python train_selfplay.py --run-name big --device cuda --num-envs 1024 --threads 32 \
@@ -160,7 +170,32 @@ uv run python evaluate.py --model runs/big/model_latest.pt --players 8          
 uv run python evaluate.py --model runs/big/model_latest.pt --opponent runs/big/pool/model_02000.pt --players 2
 ```
 
-### Playing on a server
+### Joining a room on curvytron.com (interactive)
+
+```bash
+uv run python play_room.py
+```
+
+It asks for the model (lists the checkpoints in `runs/`, newest first), the room
+URL as shown in the browser (e.g. `https://www.curvytron.com/#/room/My%20Room`,
+including `?password=...` for private rooms), the bot's nickname and its colour.
+They can also be given as `--model`, `--room`, `--name`, `--color`. The bot then
+joins the room and plays every game on its own, while the console lets you do
+what a player does in the browser:
+
+* plain text is sent to the room chat, and the chat is shown in the console
+* `/ready`, `/auto on|off` (auto-ready, only once another player is in the room, so
+  the bot never starts solo games that lock others out), `/spectate`, `/play`
+* `/kick <player>` to vote (or kick directly as room master), `/votes`, `/players`
+* `/name`, `/color`, `/greedy on|off`, `/status` (role, latency, rounds won), `/quit`
+* `/aggression [x]`: show or change how much the bot hunts (also `--aggression` at start)
+* as room master: `/launch`, `/maxscore`, `/bonuses`, `/bonus <name>`, `/bonusrate`, `/open on|off`
+
+If a game is already running when the bot arrives, it watches and joins the
+players when the game ends (the server does not allow joining mid-game).
+`/help` lists all commands, with tab completion for commands and player names.
+
+### Playing on a server (scripted)
 
 ```bash
 uv run python curvybot.py --model runs/big/model_latest.pt --server curvytron.com --room <room> --games 0

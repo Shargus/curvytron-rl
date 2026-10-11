@@ -10,7 +10,7 @@ Observation layout (all roughly in [-1, 2]):
     bonuses   K_BON x F_BON: every bonus on the map, nearest first: straight-line distance and
                            direction, grid path around trails (reachable, length, reached
                            before every opponent) and one-hot type
-    self      N_SELF       : own state, effects, timers, latency, last moves sent
+    self      N_SELF       : own state, effects, timers, latency, aggression, last moves sent
     lookahead N_LOOK       : survival of each move under a short tree search (2 horizons)
     territory N_TERR       : share of the board reachable first, now and after each move
 """
@@ -32,7 +32,7 @@ K_OPP = 7
 F_OPP = 13
 K_BON = BONUS_CAP   # every bonus on the map (the server caps them at 20), nearest first
 F_BON = 7 + NB      # valid, distance, direction (2), path: reachable, length, first; type one-hot
-N_SELF = 23 + NB + 1 + 3 * HIST
+N_SELF = 23 + NB + 2 + 3 * HIST
 N_LOOK = 12        # lookahead search features (see lookahead_features)
 N_TERR = 12        # territory features (see territory_features)
 OBS_DIM = N_RAYS * 3 + K_OPP * F_OPP + K_BON * F_BON + N_SELF + N_LOOK + N_TERR
@@ -197,7 +197,8 @@ def write_obs(S, e, p, out):
                 out[o + t] = rem
     o += NB
     out[o] = S.delay[e, p] / 15.0
-    o += 1
+    out[o + 1] = S.aggr[e, p]   # kill bonus this player plays for ("hunting vs surviving")
+    o += 2
     for k in range(HIST):
         for m in range(3):
             out[o + 3 * k + m] = 1.0 if S.hist[e, p, k] == m - 1 else 0.0
