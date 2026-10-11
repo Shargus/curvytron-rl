@@ -25,8 +25,11 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
+from tensorboard.compat.proto.summary_pb2 import Summary
+
 from curvysim import BatchEnv, OBS_DIM
 from curvysim.policy import ActorCritic, save_policy, load_policy
+from curvysim.render import render, encode_gif
 
 SELF, HEURISTIC = -1, -2
 
@@ -66,6 +69,11 @@ def parse_args():
     p.add_argument('--eval-rounds', type=int, default=300)
     p.add_argument('--save-every', type=int, default=50)
     p.add_argument('--log-every', type=float, default=60.0, help='seconds between progress reports')
+    p.add_argument('--video-every', type=int, default=None,
+                   help='updates between sample videos (default: --eval-every, 0 = off)')
+    p.add_argument('--video-players', type=int, default=6)
+    p.add_argument('--video-opponent', default='self', choices=['self', 'heuristic'],
+                   help='who controls the other avatars in the video')
     p.add_argument('--threads', type=int, default=8)
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--resume', default=None, help='checkpoint to initialise from')
@@ -128,6 +136,44 @@ def evaluate(model, opponent, rounds, seed, n_players=2, bonus_modes=(0.3, 0.4, 
             my_slot[e] = rng.integers(0, n_players)
     results = np.array(results[:rounds])
     return float(results.mean()), float((results > 0.99).mean())   # win = last survivor
+
+
+@torch.no_grad()
+def record_video(model, n_players, opponent, seed, frame_skip, delay, size_px=240, stride=2, max_seconds=90):
+    """Play one round (all bonuses on) and return (frames, info). The model controls a random
+    slot, drawn with a white ring; the others are the model too ('self') or the heuristic."""
+    probs = [0.0] * (n_players - 1)
+    probs[-1] = 1.0
+    env = BatchEnv(1, max_players=n_players, n_probs=probs, bonus_modes=(0, 1, 0), seed=seed,
+                   map_size=model.map_size, global_map=model.global_map, delay=delay, frame_skip=frame_skip)
+    env.reset()
+    me = np.random.default_rng(seed).integers(0, n_players)
+    slots = np.arange(n_players)[None, :]
+    frames = [render(env.S, 0, size_px, me)]
+    ret = 0.0
+    step = 0
+    max_steps = int(max_seconds * 60 / frame_skip)
+    while step < max_steps:
+        alive = env.alive
+        mine = alive & (slots == me)
+        others = alive & ~mine
+        actions = np.zeros((1, n_players), np.int64)
+        if opponent == 'self':
+            actions[alive] = policy_moves(model, env, alive)
+        else:
+            actions[mine] = policy_moves(model, env, mine)
+            actions[others] = env.heuristic(others)[others]
+        _, rew, done, reset = env.step(actions)
+        ret += rew[0, me]
+        step += 1
+        if reset[0]:
+            break
+        if step % stride == 0:
+            frames.append(render(env.S, 0, size_px, me))
+    frames += [frames[-1]] * 10   # hold the last frame for a moment
+    placement = int(round((ret + 1) / 2 * (n_players - 1)))   # points: 0 = first out, n-1 = survivor
+    info = {'seconds': step * frame_skip / 60, 'rank': n_players - placement, 'fps': 60 / (frame_skip * stride)}
+    return frames, info
 
 
 class OpponentPool:
@@ -323,6 +369,9 @@ def main():
     episodes = deque(maxlen=5000)   # recent learner rounds, for logs
     rounds_done = 0
     ppo_hist = deque(maxlen=20)     # recent per-update PPO diagnostics
+
+    video_every = args.eval_every if args.video_every is None else args.video_every
+    os.makedirs(os.path.join(run_dir, 'videos'), exist_ok=True)
 
     total_steps = 0
     update = 0
@@ -541,6 +590,22 @@ def main():
             else:
                 log(f"  score {ev['score']:+.3f} (best so far {best_score:+.3f})")
             last_ev = ev
+
+        if video_every and update % video_every == 0:
+            model.eval()
+            frames, info = record_video(model, args.video_players, args.video_opponent, seed=update,
+                                        frame_skip=args.frame_skip, delay=delay)
+            gif = encode_gif(frames, info['fps'])
+            path = os.path.join(run_dir, 'videos', f'round_{update:05d}.gif')
+            with open(path, 'wb') as f:
+                f.write(gif)
+            h, w = frames[0].shape[:2]
+            img = Summary.Image(height=h, width=w, colorspace=3, encoded_image_string=gif)
+            writer._get_file_writer().add_summary(
+                Summary(value=[Summary.Value(tag='video/sample_round', image=img)]), total_steps)
+            log(f"  video    {path}: {args.video_players} players (others: {args.video_opponent}), bot ringed "
+                f"in white finished #{info['rank']} of {args.video_players} after {info['seconds']:.0f}s "
+                f"| tensorboard: Images tab, video/sample_round")
 
     save_policy(os.path.join(run_dir, 'model_final.pt'), model,
                 {'steps': total_steps, 'update': update, 'args': vars(args)})

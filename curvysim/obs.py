@@ -7,7 +7,9 @@ produces observations online.
 Observation layout (all roughly in [-1, 2]):
     rays      N_RAYS x 3   : distance/RAY_MAX, min(distance, 8)/8, hit-is-wall
     opponents K_OPP x 13   : nearest alive opponents (relative, egocentric)
-    bonuses   K_BON x 16   : nearest bonuses on the map (relative, one-hot type)
+    bonuses   K_BON x F_BON: every bonus on the map, nearest first: straight-line distance and
+                           direction, grid path around trails (reachable, length, reached
+                           before every opponent) and one-hot type
     self      N_SELF       : own state, effects, timers, latency, last moves sent
     lookahead N_LOOK       : survival of each move under a short tree search (2 horizons)
     territory N_TERR       : share of the board reachable first, now and after each move
@@ -29,7 +31,7 @@ RAY_NEAR = 8.0
 K_OPP = 7
 F_OPP = 13
 K_BON = BONUS_CAP   # every bonus on the map (the server caps them at 20), nearest first
-F_BON = 4 + NB
+F_BON = 7 + NB      # valid, distance, direction (2), path: reachable, length, first; type one-hot
 N_SELF = 23 + NB + 1 + 3 * HIST
 N_LOOK = 12        # lookahead search features (see lookahead_features)
 N_TERR = 12        # territory features (see territory_features)
@@ -134,7 +136,8 @@ def write_obs(S, e, p, out):
             for i in range(F_OPP):
                 out[o + i] = 0.0
         o += F_OPP
-    # --- bonuses, nearest first
+    # --- bonuses, nearest first (path features are filled in by territory_features)
+    o_bon = o
     bd = np.full(BONUS_CAP, 1e9)
     for b in range(BONUS_CAP):
         if S.btype[e, b] >= 0:
@@ -152,7 +155,7 @@ def write_obs(S, e, p, out):
             out[o + 1] = min(d / RAY_MAX, 2.0)
             out[o + 2] = (rx * ca + ry * sa) / d
             out[o + 3] = (-rx * sa + ry * ca) / d
-            out[o + 4 + S.btype[e, b]] = 1.0
+            out[o + 7 + S.btype[e, b]] = 1.0
         o += F_BON
     # --- self
     n_alive = 0
@@ -201,7 +204,7 @@ def write_obs(S, e, p, out):
     o += 3 * HIST
     lookahead_features(S, e, p, out, o)
     o += N_LOOK
-    territory_features(S, e, p, out, o)
+    territory_features(S, e, p, out, o, o_bon, border, bd)
 
 
 @nb.njit(parallel=True, cache=True)
@@ -534,10 +537,46 @@ def _territory(S, e, x, y, d_opp, dist, queue, bless, n_free):
 
 
 @nb.njit(cache=True)
-def territory_features(S, e, p, out, o):
+def _bonus_paths(S, e, p, out, o_bon, border, bd, dist, d_opp, bless):
+    """Per bonus (same order as the bonus block): reachable through free cells, path length
+    (board units / RAY_MAX) and whether we get there before every opponent. A bonus counts as
+    reached anywhere within catch range of its centre."""
+    cs = S.size[e] / GRID
+    reach_r = BONUS_R + S.rad[e, p]
+    rc = int(math.ceil(reach_r / cs))
+    for k in range(K_BON):
+        b = border[k]
+        if bd[b] >= 1e8:
+            continue
+        ci, cj = _cell(S, e, S.bx[e, b], S.by[e, b])
+        best_me = INF
+        best_opp = INF
+        for di in range(-rc, rc + 1):
+            for dj in range(-rc, rc + 1):
+                if (di * di + dj * dj) * cs * cs > (reach_r + cs) ** 2:
+                    continue
+                i = ci + di
+                j = cj + dj
+                if bless:
+                    i %= GRID
+                    j %= GRID
+                elif i < 0 or j < 0 or i >= GRID or j >= GRID:
+                    continue
+                best_me = min(best_me, dist[i, j])
+                best_opp = min(best_opp, d_opp[i, j])
+        f = o_bon + k * F_BON
+        if best_me < INF:
+            out[f + 4] = 1.0
+            out[f + 5] = min(best_me * cs / RAY_MAX, 3.0)
+            out[f + 6] = 1.0 if best_me < best_opp else 0.0
+
+
+@nb.njit(cache=True)
+def territory_features(S, e, p, out, o, o_bon, border, bd):
     """Voronoi-style territory on the coarse grid (all heads assumed equally fast):
     now, and for each move held for ~0.8 s after the moves already in flight:
-    [survives the hold, share of free board reached first, share reachable]."""
+    [survives the hold, share of free board reached first, share reachable].
+    Also fills the path features of the bonus block starting at ``o_bon``."""
     bless = _is_borderless(S, e)
     n_free = 0
     for i in range(GRID):
@@ -557,6 +596,7 @@ def territory_features(S, e, p, out, o):
             k += 1
     _bfs(S, e, si, sj, k, d_opp, queue, bless)
     mine, reach = _territory(S, e, S.x[e, p], S.y[e, p], d_opp, dist, queue, bless, n_free)
+    _bonus_paths(S, e, p, out, o_bon, border, bd, dist, d_opp, bless)
     out[o] = mine
     out[o + 1] = reach
     out[o + 2] = n_free / (GRID * GRID)

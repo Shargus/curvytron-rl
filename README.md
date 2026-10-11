@@ -72,7 +72,7 @@ All features are egocentric (relative to the avatar's heading):
 
 * 64 raycasts around the avatar: distance to the nearest trail or wall, plus a near-range and a hit-is-wall channel
 * the 7 nearest opponents: relative position and heading, speed, size, printing/invincible/inverted/straight-angle state, turning direction
-* every bonus on the map (up to 20, nearest first): relative position and type
+* every bonus on the map (up to 20, nearest first): type, straight-line distance and direction, and the grid path around trails (reachable at all, path length, whether the bot gets there before every opponent)
 * own state: position, speed, size, active effects with their remaining time, time before trails start, distance since the last hole
 * latency: the current round trip (in frames) and the last 8 moves sent
 * lookahead: for each move, sent now (i.e. after the moves already in flight), how long the avatar survives holding it, then with the best follow-up (two horizons)
@@ -131,6 +131,14 @@ the bot dies (walls, its own trail, others' trails) and PPO health. Each
 evaluation adds a block with the change since the previous one. The output is
 plain text, flushed line by line, and is also appended to `runs/<run-name>/train.log`,
 so it works the same in a terminal or in a Slurm `sbatch` output file.
+
+Sample videos: every `--video-every` updates (default: at each evaluation) the
+trainer plays one round with all bonuses on (`--video-players`, default 6; the other
+avatars are the bot itself or the heuristic, `--video-opponent`) and saves it as an
+animated GIF, both in `runs/<run-name>/videos/` and in tensorboard (Images tab,
+`video/sample_round`, with a slider over training steps). The bot being followed
+has a white ring; bonus rings are green (affect the catcher), red (affect enemies)
+or blue (whole game), and the border turns dashed blue in borderless mode.
 
 Outputs go to `runs/<run-name>/`: `model_latest.pt`, a checkpoint per evaluation in
 `pool/`, and tensorboard logs. The evaluations play against the lookahead
