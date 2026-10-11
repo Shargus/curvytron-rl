@@ -125,6 +125,13 @@ and 1024 envs, held in RAM and on the GPU during the update). With everything en
 the simulator produces ~1k agent-steps/s per core; the territory search and the maps
 are the expensive part.
 
+Every `--log-every` seconds (default 60) the trainer prints a progress report:
+speed and ETA, round results against each opponent type and per table size, how
+the bot dies (walls, its own trail, others' trails) and PPO health. Each
+evaluation adds a block with the change since the previous one. The output is
+plain text, flushed line by line, and is also appended to `runs/<run-name>/train.log`,
+so it works the same in a terminal or in a Slurm `sbatch` output file.
+
 Outputs go to `runs/<run-name>/`: `model_latest.pt`, a checkpoint per evaluation in
 `pool/`, and tensorboard logs. The evaluations play against the lookahead
 heuristic in 2, 4 and 8 player rounds (`eval/win_heur_*`: rate of surviving the

@@ -62,7 +62,7 @@ def _reset_all(S, n_cdf, bonus_mode_cdf, bonus_p, delay_lo, delay_hi, prev_ps, P
 
 @nb.njit(parallel=True, cache=True)
 def _step_all(S, actions, frame_skip, delay_lo, delay_hi, jitter, max_t, n_cdf, bonus_mode_cdf, bonus_p,
-              prev_ps, rew, done, reset_flag, P):
+              prev_ps, rew, done, cause, reset_flag, P):
     E = S.size.shape[0]
     for e in nb.prange(E):
         n = S.n[e]
@@ -88,12 +88,14 @@ def _step_all(S, actions, frame_skip, delay_lo, delay_hi, jitter, max_t, n_cdf, 
         for p in range(P):
             rew[e, p] = 0.0
             done[e, p] = False
+            cause[e, p] = -1
             if p < n and alive0[p]:
                 ps = potential_score(S, e, p)
                 rew[e, p] = (ps - prev_ps[e, p]) * scale
                 prev_ps[e, p] = ps
                 if S.over[e] or not S.alive[e, p]:
                     done[e, p] = True
+                    cause[e, p] = S.cause[e, p]   # -1: survived the round (or timeout)
                     rew[e, p] -= 1.0
         reset_flag[e] = S.over[e]
         if S.over[e]:
@@ -143,6 +145,7 @@ class BatchEnv:
         self.prev_ps = np.zeros((num_envs, max_players))
         self.rew = np.zeros((num_envs, max_players), np.float32)
         self.done = np.zeros((num_envs, max_players), np.bool_)
+        self.cause = np.full((num_envs, max_players), -1, np.int8)   # death cause of agents done this step
         self.reset_flag = np.zeros(num_envs, np.bool_)
         self.obs = np.zeros((num_envs, max_players, OBS_DIM), np.float32)
         self.map_size = int(map_size)
@@ -177,7 +180,7 @@ class BatchEnv:
         actions = np.ascontiguousarray(actions, dtype=np.int64)
         _step_all(self.S, actions, self.frame_skip, self.delay_lo, self.delay_hi, self.jitter, self.max_t,
                   self.n_cdf, self.bonus_mode_cdf, self.bonus_p, self.prev_ps,
-                  self.rew, self.done, self.reset_flag, self.P)
+                  self.rew, self.done, self.cause, self.reset_flag, self.P)
         return self.observe(), self.rew, self.done, self.reset_flag
 
     def heuristic(self, mask, eps=0.3):

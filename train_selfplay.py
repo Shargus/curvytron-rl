@@ -65,6 +65,7 @@ def parse_args():
     p.add_argument('--eval-every', type=int, default=50)
     p.add_argument('--eval-rounds', type=int, default=300)
     p.add_argument('--save-every', type=int, default=50)
+    p.add_argument('--log-every', type=float, default=60.0, help='seconds between progress reports')
     p.add_argument('--threads', type=int, default=8)
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--resume', default=None, help='checkpoint to initialise from')
@@ -172,8 +173,63 @@ class OpponentPool:
             if e['id'] == opp_id:
                 e['win'] = 0.98 * e['win'] + 0.02 * float(learner_score)
 
-    def summary(self):
-        return ' '.join(f"{e['id']}:{e['win']:.2f}" for e in self.entries[-8:])
+    def summary(self, k=3):
+        hardest = sorted(self.entries, key=lambda e: e['win'])[:k]
+        return (f"{len(self.entries)} snapshots, hardest for the learner (placement score, 0.5 = even): "
+                + ', '.join(f"#{e['id']} {e['win']:.2f}" for e in hardest))
+
+
+class RunLog:
+    """Prints to stdout and appends to runs/<run>/train.log."""
+
+    def __init__(self, path):
+        self.f = open(path, 'a', buffering=1)
+
+    def __call__(self, text=''):
+        print(text, flush=True)
+        self.f.write(text + '\n')
+
+
+def fmt_time(seconds):
+    if not np.isfinite(seconds):
+        return '?'
+    seconds = int(seconds)
+    h, m = divmod(seconds // 60, 60)
+    return f'{h}h{m:02d}m' if h else f'{m}m{seconds % 60:02d}s'
+
+
+def fmt_num(x):
+    return f'{x / 1e9:.2f}B' if x >= 1e9 else (f'{x / 1e6:.1f}M' if x >= 1e6 else f'{x / 1e3:.1f}k')
+
+
+def episode_report(episodes, frame_skip):
+    """Summary lines over recent learner rounds. Each episode is a dict with
+    ctrl, ret, len (decisions), n (players) and cause (-1 survived, 0 wall, 1 own, 2 other)."""
+    if not episodes:
+        return ['  rounds   none finished yet']
+    eps = list(episodes)
+    arr = lambda key, cond=lambda e: True: np.array([e[key] for e in eps if cond(e)], np.float64)
+    def res(cond):
+        r = arr('ret', cond)
+        if len(r) == 0:
+            return 'n/a'
+        return f"survives {np.mean(r > 0.99) * 100:4.1f}%  ret {np.mean(r):+.3f}  ({len(r)} rounds)"
+    lines = []
+    secs = arr('len') * frame_skip / 60.0
+    lines.append(f"  rounds   last {len(eps)} learner rounds: avg survival {np.mean(secs):.1f}s of game time, "
+                 f"avg {np.mean(arr('n')):.1f} players")
+    lines.append(f"  vs self      {res(lambda e: e['ctrl'] == SELF)}")
+    lines.append(f"  vs heuristic {res(lambda e: e['ctrl'] == HEURISTIC)}")
+    lines.append(f"  vs pool      {res(lambda e: e['ctrl'] >= 0)}")
+    lines.append('  by size  ' + ' | '.join(
+        f"{lo}-{hi}p ret {np.mean(r):+.3f}" if len(r := arr('ret', lambda e, lo=lo, hi=hi: lo <= e['n'] <= hi))
+        else f"{lo}-{hi}p n/a" for lo, hi in ((2, 2), (3, 6), (7, 16))))
+    c = arr('cause')
+    died = c[c >= 0]
+    if len(died):
+        lines.append(f"  deaths   wall {np.mean(died == 0) * 100:4.1f}% | own trail {np.mean(died == 1) * 100:4.1f}% | "
+                     f"others' trails {np.mean(died == 2) * 100:4.1f}%   (of {len(died)} deaths)")
+    return lines
 
 
 def main():
@@ -187,6 +243,7 @@ def main():
     with open(os.path.join(run_dir, 'args.json'), 'w') as f:
         json.dump(vars(args), f, indent=2)
     writer = SummaryWriter(run_dir)
+    log = RunLog(os.path.join(run_dir, 'train.log'))
 
     hidden = tuple(int(h) for h in args.hidden.split(','))
     device = torch.device(args.device)
@@ -227,9 +284,27 @@ def main():
     def learner_mask(alive):
         return alive & ((ctrl[:, None] == SELF) | (slot_idx == learner_slot[:, None]))
 
+    n_params = sum(p.numel() for p in model.parameters())
+    dev_name = torch.cuda.get_device_name(device) if device.type == 'cuda' else f'cpu ({args.threads} threads)'
+    log('=' * 100)
+    log(f"Curvytron self-play PPO | run '{args.run_name}' | {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log(f"  device      {dev_name}")
+    log(f"  model       {n_params / 1e6:.2f}M parameters | features {OBS_DIM} | hidden {hidden}"
+        f" | local map {f'{M}x{M}' if M else 'off'} | whole-board map {'on' if args.global_map else 'off'}")
+    log(f"  envs        {E} parallel rounds, 2-{P} players, decision every {args.frame_skip} frames "
+        f"({args.frame_skip * 1000 / 60:.0f} ms), latency {delay[0]}-{delay[1]} frames")
+    log(f"  opponents   self {args.p_self:.0%} | heuristic {args.p_heuristic:.0%} | "
+        f"pool {max(0.0, 1 - args.p_self - args.p_heuristic):.0%} (snapshot every {args.snapshot_every} updates)")
+    log(f"  ppo         rollout {T} | gamma {args.gamma} | lambda {args.lam} | lr {args.lr} | "
+        f"minibatch {args.minibatch} x {args.epochs} epochs | target {fmt_num(args.total_steps)} steps")
+    log(f"  output      {run_dir}  (tensorboard --logdir runs)")
+    log('  compiling the simulator on first use (~1-2 min) ...')
+    log('=' * 100)
+
     pool.add(model)
     env.reset()
     assign(range(E))
+    n_round = env.S.n.copy()   # players in each env's current round
 
     # observations are stored only for learner rows (row-major order of the [E, P] mask),
     # which matches buf_valid.reshape(-1) when concatenated over t
@@ -245,11 +320,18 @@ def main():
 
     ep_ret = np.zeros((E, P))
     ep_len = np.zeros((E, P))
-    stats = {k: deque(maxlen=2000) for k in ('ret_self', 'ret_pool', 'ret_heur', 'len', 'win_heur', 'win_pool')}
+    episodes = deque(maxlen=5000)   # recent learner rounds, for logs
+    rounds_done = 0
+    ppo_hist = deque(maxlen=20)     # recent per-update PPO diagnostics
 
     total_steps = 0
     update = 0
     t_start = time.time()
+    t_last_log = t_start
+    steps_last_log = 0
+    t_roll_sum = t_train_sum = 0.0
+    best_score = -np.inf
+    last_ev = None
 
     while total_steps < args.total_steps:
         frac = min(total_steps / args.total_steps, 1.0)
@@ -295,20 +377,17 @@ def main():
             ep_ret += np.where(learner, rew, 0.0)
             ep_len += learner
             for e, p in zip(*np.nonzero(done & learner)):
-                c = ctrl[e]
-                won = ep_ret[e, p] > 0.99
-                key = 'ret_self' if c == SELF else ('ret_heur' if c == HEURISTIC else 'ret_pool')
-                stats[key].append(ep_ret[e, p])
-                stats['len'].append(ep_len[e, p])
-                if c == HEURISTIC:
-                    stats['win_heur'].append(float(won))
-                elif c != SELF:
-                    stats['win_pool'].append(float(won))
+                c = int(ctrl[e])
+                episodes.append({'ctrl': c, 'ret': ep_ret[e, p], 'len': ep_len[e, p],
+                                 'n': int(n_round[e]), 'cause': int(env.cause[e, p])})
+                if c >= 0:
                     pool.record(c, (ep_ret[e, p] + 1.0) / 2.0)   # placement in [0, 1]
                 ep_ret[e, p] = 0.0
                 ep_len[e, p] = 0.0
             if reset.any():
+                rounds_done += int(reset.sum())
                 assign(np.nonzero(reset)[0])
+                n_round[reset] = env.S.n[reset]
         t_roll = time.time() - t_roll
 
         # bootstrap values and GAE (per agent stream; gaps after a death are skipped)
@@ -337,6 +416,9 @@ def main():
         b_ret = b_adv + torch.from_numpy(buf_val.reshape(-1)[valid]).to(device)
         N = b_obs.shape[0]
         total_steps += N
+        with torch.no_grad():
+            b_val = b_ret - b_adv
+            explained_var = float(1 - (b_ret - b_val).var() / (b_ret.var() + 1e-8))
 
         t_train = time.time()
         model.train()
@@ -368,25 +450,55 @@ def main():
                 ents.append(ent.item())
         t_train = time.time() - t_train
         update += 1
+        t_roll_sum += t_roll
+        t_train_sum += t_train
+        ppo_hist.append({'ent': np.mean(ents), 'kl': np.mean(kls), 'clip': np.mean(clipfracs),
+                         'vl': np.mean(v_losses), 'ev': explained_var})
 
         if update % args.snapshot_every == 0:
             pool.add(model)
 
-        mean = lambda k: float(np.mean(stats[k])) if stats[k] else float('nan')
-        sps = total_steps / (time.time() - t_start)
+        now = time.time()
+        sps = total_steps / (now - t_start)
         writer.add_scalar('perf/sps', sps, total_steps)
         writer.add_scalar('loss/policy', np.mean(pg_losses), total_steps)
         writer.add_scalar('loss/value', np.mean(v_losses), total_steps)
         writer.add_scalar('loss/entropy', np.mean(ents), total_steps)
         writer.add_scalar('loss/approx_kl', np.mean(kls), total_steps)
         writer.add_scalar('loss/clipfrac', np.mean(clipfracs), total_steps)
-        for k in stats:
-            writer.add_scalar(f'train/{k}', mean(k), total_steps)
-        if update % 10 == 0:
-            print(f"upd {update:5d} steps {total_steps / 1e6:7.2f}M sps {sps:6.0f} "
-                  f"(roll {t_roll:.1f}s train {t_train:.1f}s N {N}) "
-                  f"len {mean('len'):5.0f} win_heur {mean('win_heur'):.3f} win_pool {mean('win_pool'):.3f} "
-                  f"ent {np.mean(ents):.3f} kl {np.mean(kls):.4f} vl {np.mean(v_losses):.3f}", flush=True)
+        writer.add_scalar('loss/explained_variance', explained_var, total_steps)
+        if episodes:
+            recent = list(episodes)[-500:]
+            for name, cond in (('self', lambda e: e['ctrl'] == SELF), ('heur', lambda e: e['ctrl'] == HEURISTIC),
+                               ('pool', lambda e: e['ctrl'] >= 0)):
+                r = [e['ret'] for e in recent if cond(e)]
+                if r:
+                    writer.add_scalar(f'train/ret_{name}', np.mean(r), total_steps)
+            died = [e['cause'] for e in recent if e['cause'] >= 0]
+            if died:
+                for i, name in enumerate(('wall', 'own', 'other')):
+                    writer.add_scalar(f'train/death_{name}', np.mean(np.array(died) == i), total_steps)
+
+        if update == 1 or now - t_last_log >= args.log_every:
+            recent_sps = (total_steps - steps_last_log) / max(now - t_last_log, 1e-6)
+            eta = (args.total_steps - total_steps) / max(recent_sps, 1e-6)
+            h = {k: np.mean([d[k] for d in ppo_hist]) for k in ppo_hist[0]}
+            lr_now = optim.param_groups[0]['lr']
+            log(f"[{fmt_time(now - t_start)} elapsed | update {update} | {fmt_num(total_steps)} / "
+                f"{fmt_num(args.total_steps)} steps ({100 * total_steps / args.total_steps:.1f}%) | "
+                f"ETA {fmt_time(eta)}]")
+            log(f"  speed    {fmt_num(recent_sps)} steps/s now, {fmt_num(sps)} avg | time split: simulate+act "
+                f"{100 * t_roll_sum / max(t_roll_sum + t_train_sum, 1e-9):.0f}%, learn "
+                f"{100 * t_train_sum / max(t_roll_sum + t_train_sum, 1e-9):.0f}% | {rounds_done} rounds played")
+            for line in episode_report(episodes, args.frame_skip):
+                log(line)
+            log(f"  ppo      entropy {h['ent']:.3f} (max 1.099 = random) | kl {h['kl']:.4f} | clipped "
+                f"{100 * h['clip']:.1f}% | value loss {h['vl']:.4f} | explained var {h['ev']:.2f} | "
+                f"lr {lr_now:.2e} | entropy coef {ent_coef:.4f}")
+            log(f"  pool     {pool.summary()}")
+            t_last_log = now
+            steps_last_log = total_steps
+            t_roll_sum = t_train_sum = 0.0
 
         if update % args.save_every == 0:
             save_policy(os.path.join(run_dir, 'model_latest.pt'), model,
@@ -404,17 +516,37 @@ def main():
             ev['ret_past_6p'], ev['win_past_6p'] = evaluate(
                 model, ref, args.eval_rounds, seed=update + 1, n_players=6, delay=delay,
                 frame_skip=args.frame_skip)
+            # one number to track: mean round return vs the heuristic over 2, 4 and 8 players
+            ev['score'] = float(np.mean([ev[f'ret_heur_{n}p'] for n in (2, 4, 8)]))
             for k, v in ev.items():
                 writer.add_scalar(f'eval/{k}', v, total_steps)
-            print(f"  EVAL upd {update}: vs heuristic win/ret "
-                  + ' | '.join(f"{n}p {ev[f'win_heur_{n}p']:.3f}/{ev[f'ret_heur_{n}p']:+.3f}" for n in (2, 4, 8))
-                  + f" | 6p vs snapshot(-8) {ev['win_past_6p']:.3f}/{ev['ret_past_6p']:+.3f}"
-                  + f" | pool win-rates {pool.summary()}", flush=True)
+            def delta(k, scale=1.0, digits=1):
+                return f" ({(ev[k] - last_ev[k]) * scale:+.{digits}f})" if last_ev else ''
+            log(f"  ---- EVALUATION after {fmt_num(total_steps)} steps ({args.eval_rounds} rounds each, "
+                f"in parentheses: change since last evaluation) ----")
+            for n in (2, 4, 8):
+                log(f"  vs heuristic, {n} players: survives {100 * ev[f'win_heur_{n}p']:5.1f}%"
+                    f"{delta(f'win_heur_{n}p', 100)} | ret {ev[f'ret_heur_{n}p']:+.3f}"
+                    f"{delta(f'ret_heur_{n}p', digits=3)}")
+            log("  (ret: +1 = always last alive, 0 = average placement, -1 = always first out)")
+            log(f"  vs itself {8 * args.snapshot_every} updates ago, 6 players: survives "
+                f"{100 * ev['win_past_6p']:5.1f}% | ret {ev['ret_past_6p']:+.3f}   (> 0 means it improved)")
             path = os.path.join(run_dir, 'pool', f'model_{update:05d}.pt')
             save_policy(path, model, {'steps': total_steps, 'update': update, 'eval': ev, 'args': vars(args)})
+            if ev['score'] > best_score:
+                best_score = ev['score']
+                save_policy(os.path.join(run_dir, 'model_best.pt'), model,
+                            {'steps': total_steps, 'update': update, 'eval': ev, 'args': vars(args)})
+                log(f"  score {ev['score']:+.3f} -> new best, saved model_best.pt")
+            else:
+                log(f"  score {ev['score']:+.3f} (best so far {best_score:+.3f})")
+            last_ev = ev
 
     save_policy(os.path.join(run_dir, 'model_final.pt'), model,
                 {'steps': total_steps, 'update': update, 'args': vars(args)})
+    log('=' * 100)
+    log(f"done: {fmt_num(total_steps)} steps in {fmt_time(time.time() - t_start)}, best evaluation score "
+        f"{best_score:+.3f} -> {run_dir}/model_best.pt, last model {run_dir}/model_final.pt")
     writer.close()
 
 
