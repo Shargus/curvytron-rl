@@ -29,6 +29,8 @@ class CurvytronEnv(gym.Env):
     metadata = {'render.modes': ['human']}
 
     def __init__(self, server, room, **kwargs):
+        on_bonuses = kwargs.pop('on_bonuses', None)
+        max_score = kwargs.pop('max_score', 3)
         # Connect to the curvytron server
         self.client = client.CurvytronClient(**kwargs)
         self.client.start()
@@ -36,7 +38,7 @@ class CurvytronEnv(gym.Env):
         time.sleep(1)   # needed to give the client time to connect before joining a room
         
         # Join the specified room (or create it if it doesn't exist)
-        self.client.join_room(room)
+        self.client.join_room(room, on_bonuses=on_bonuses, max_score=max_score)
 
         # There's only three actions: left, right, ahead.
         self.action_space = spaces.Discrete(3)
