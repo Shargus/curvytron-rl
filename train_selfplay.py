@@ -334,7 +334,11 @@ def main():
         return alive & ((ctrl[:, None] == SELF) | (slot_idx == learner_slot[:, None]))
 
     n_params = sum(p.numel() for p in model.parameters())
-    dev_name = torch.cuda.get_device_name(device) if device.type == 'cuda' else f'cpu ({args.threads} threads)'
+    if device.type == 'cuda':
+        gpu_total = torch.cuda.get_device_properties(device).total_memory / 1e9
+        dev_name = f'{torch.cuda.get_device_name(device)} ({gpu_total:.1f} GB)'
+    else:
+        dev_name = f'cpu ({args.threads} threads)'
     log('=' * 100)
     log(f"Curvytron self-play PPO | run '{args.run_name}' | {time.strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"  device      {dev_name}")
@@ -382,6 +386,7 @@ def main():
     t_last_log = t_start
     steps_last_log = 0
     t_roll_sum = t_train_sum = 0.0
+    gpu_peak_all = 0.0
     best_score = -np.inf
     last_ev = None
 
@@ -547,6 +552,16 @@ def main():
             log(f"  speed    {fmt_num(recent_sps)} steps/s now, {fmt_num(sps)} avg | time split: simulate+act "
                 f"{100 * t_roll_sum / max(t_roll_sum + t_train_sum, 1e-9):.0f}%, learn "
                 f"{100 * t_train_sum / max(t_roll_sum + t_train_sum, 1e-9):.0f}% | {rounds_done} rounds played")
+            if device.type == 'cuda':
+                # peaks since the previous report; 'reserved' is what PyTorch holds (what nvidia-smi shows, minus
+                # the CUDA context), 'allocated' what tensors actually use
+                peak = torch.cuda.max_memory_allocated(device) / 1e9
+                peak_res = torch.cuda.max_memory_reserved(device) / 1e9
+                gpu_peak_all = max(gpu_peak_all, peak_res)
+                writer.add_scalar('perf/gpu_peak_reserved_gb', peak_res, total_steps)
+                log(f"  gpu mem  peak {peak:.1f} GB allocated, {peak_res:.1f} GB reserved of {gpu_total:.1f} GB "
+                    f"({100 * peak_res / gpu_total:.0f}%) | highest reserved so far {gpu_peak_all:.1f} GB")
+                torch.cuda.reset_peak_memory_stats(device)
             for line in episode_report(episodes, args.frame_skip):
                 log(line)
             log(f"  ppo      entropy {h['ent']:.3f} (max 1.099 = random) | kl {h['kl']:.4f} | clipped "

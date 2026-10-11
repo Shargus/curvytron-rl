@@ -123,7 +123,8 @@ and a 32768 minibatch needs ~20-25 GB of activations, so the command above needs
 large GPU (40-80 GB). On a ~20 GB GPU add `--rollout-on-cpu --minibatch 8192`: the
 rollout then stays in RAM and only minibatches are sent to the GPU (~7 GB), at the
 cost of slower updates. The progress log shows how the time splits between
-simulating and learning.
+simulating and learning, and the peak GPU memory since the previous report
+(`gpu mem` line, also in tensorboard as `perf/gpu_peak_reserved_gb`).
 
 Set `--threads` to about the number of physical cores (it drives both torch and
 the numba simulator). The first start compiles the simulator (~1-2 minutes, then cached).
