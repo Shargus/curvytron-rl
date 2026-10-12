@@ -1,10 +1,13 @@
 """Self-play PPO for Curvytron on the fast numba simulator (curvysim).
 
-Each environment runs one round with 2..P players. Per round, the opponents of
-the learner are either the current policy (pure self-play: every slot produces
-training data), a frozen snapshot from the opponent pool, or the lookahead
-heuristic. Pool opponents are sampled with prioritized fictitious self-play
-(snapshots the learner struggles against are picked more often).
+Each environment runs one round with 2..P players. A share of rounds is pure
+self-play (every player is the current bot and produces training data). In the
+other rounds the current bot controls a few players and each remaining player is
+a past version of the bot (pool snapshot, sampled with prioritized fictitious
+self-play), the lookahead heuristic, or a human-like player: the heuristic or a
+snapshot with human reaction times, steering noise and confusion after maluses
+(see curvysim/env.py). The bot observes which opponents are human-like, so it can
+learn a different style against humans (e.g. using enemy maluses more).
 
 Examples:
     # laptop / CPU pilot
@@ -28,10 +31,11 @@ from torch.utils.tensorboard import SummaryWriter
 from tensorboard.compat.proto.summary_pb2 import Summary
 
 from curvysim import BatchEnv, OBS_DIM
+from curvysim.core import B_AFFECT
 from curvysim.policy import ActorCritic, save_policy, load_policy
 from curvysim.render import render, encode_gif
 
-SELF, HEURISTIC = -1, -2
+LEARNER, HEURISTIC = -1, -2
 
 
 def parse_args():
@@ -68,8 +72,22 @@ def parse_args():
                    help='keep the rollout in CPU RAM and send it per minibatch: slower updates, but GPU '
                         'memory then depends on the minibatch size only (for GPUs with ~20 GB)')
     p.add_argument('--hidden', default='512,512,256')
-    p.add_argument('--p-self', type=float, default=0.6)
-    p.add_argument('--p-heuristic', type=float, default=0.1)
+    p.add_argument('--p-selfplay', type=float, default=0.35,
+                   help='share of rounds in which every player is the current bot')
+    p.add_argument('--max-learner-share', type=float, default=0.34,
+                   help='in mixed rounds, the current bot controls 1 up to this share of the players')
+    p.add_argument('--p-human', type=float, default=0.45,
+                   help='in mixed rounds, share of the other players that are human-like')
+    p.add_argument('--p-heuristic', type=float, default=0.2,
+                   help='in mixed rounds, share of the other players that are the heuristic '
+                        '(the rest are past versions of the bot)')
+    p.add_argument('--human-base-heuristic', type=float, default=0.3,
+                   help='share of human-like players driven by the heuristic (the rest by past versions)')
+    p.add_argument('--human-delay', default='9,18', help='reaction delay of human-like players, frames')
+    p.add_argument('--human-noise', type=float, default=0.05,
+                   help='per-decision probability that a human-like player steers randomly')
+    p.add_argument('--human-confusion', type=float, default=1.0,
+                   help='how much maluses confuse human-like players (0 = not at all, 1 = default)')
     p.add_argument('--snapshot-every', type=int, default=25, help='updates between pool snapshots')
     p.add_argument('--pool-size', type=int, default=50)
     p.add_argument('--active-opponents', type=int, default=4)
@@ -80,8 +98,8 @@ def parse_args():
     p.add_argument('--video-every', type=int, default=None,
                    help='updates between sample videos (default: --eval-every, 0 = off)')
     p.add_argument('--video-players', type=int, default=6)
-    p.add_argument('--video-opponent', default='self', choices=['self', 'heuristic'],
-                   help='who controls the other avatars in the video')
+    p.add_argument('--video-opponent', default='human', choices=['self', 'heuristic', 'human'],
+                   help='who controls the other avatars in the video (human: the bot with human-like handicaps)')
     p.add_argument('--threads', type=int, default=8)
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--resume', default=None, help='checkpoint to initialise from')
@@ -104,13 +122,20 @@ def policy_moves(model, env, sel, greedy=False):
     return model.act(*to_inputs(model, env, sel), greedy=greedy).cpu().numpy() - 1
 
 
+# bonus types grouped by who they affect (for logs): enemy maluses, self bonuses, game/all
+BONUS_GROUPS = {'enemy': np.array(B_AFFECT) == 1, 'self': np.array(B_AFFECT) == 0,
+                'game': (np.array(B_AFFECT) == 2) | (np.array(B_AFFECT) == 3)}
+
+
 @torch.no_grad()
 def evaluate(model, opponent, rounds, seed, n_players=2, bonus_modes=(0.3, 0.4, 0.3), num_envs=128,
-             delay=(0, 8), frame_skip=3, aggression=0.2):
+             delay=(0, 8), frame_skip=3, aggression=0.2, human_args=None, stats=None):
     """Results of ``model`` (one random slot) vs ``opponent`` (all other slots).
 
-    opponent: an ActorCritic or the string 'heuristic'. Returns (mean return, win rate), both
-    from placement only (the kill bonus is not counted). Every player gets ``aggression``.
+    opponent: an ActorCritic, 'heuristic', or 'human' (the heuristic with human-like handicaps,
+    see BatchEnv). Returns (mean return, win rate), both from placement only (the kill bonus is
+    not counted). Every player gets ``aggression``. If ``stats`` is a dict, it receives the mean
+    number of bonuses per round the model picked up, by group.
     """
     probs = [0.0] * (n_players - 1)
     probs[-1] = 1.0
@@ -118,15 +143,25 @@ def evaluate(model, opponent, rounds, seed, n_players=2, bonus_modes=(0.3, 0.4, 
     global_map = model.global_map or getattr(opponent, 'global_map', False)
     env = BatchEnv(num_envs, max_players=n_players, n_probs=probs, bonus_modes=bonus_modes,
                    seed=seed, map_size=map_size, global_map=global_map, delay=delay,
-                   frame_skip=frame_skip, kill_reward=(aggression, aggression))
+                   frame_skip=frame_skip, kill_reward=(aggression, aggression), **(human_args or {}))
     env.reset()
     ret = np.zeros(num_envs)
     results = []
+    picks = []
     rng = np.random.default_rng(seed)
     # the server updates avatars in reverse join order, which matters in head-to-head
     # encounters, so the evaluated policy plays from a random slot
     my_slot = rng.integers(0, n_players, num_envs)
     slots = np.arange(env.P)[None, :]
+
+    def setup(e):
+        if opponent == 'human':
+            for p in range(n_players):
+                if p != my_slot[e]:
+                    env.make_human(e, p)
+
+    for e in range(num_envs):
+        setup(e)
     while len(results) < rounds:
         alive = env.alive
         actions = np.zeros((env.E, env.P), np.int64)
@@ -139,30 +174,43 @@ def evaluate(model, opponent, rounds, seed, n_players=2, bonus_modes=(0.3, 0.4, 
             actions[opp] = policy_moves(opponent, env, opp)
         _, rew, done, reset = env.step(actions)
         ret += rew[np.arange(env.E), my_slot]
+        for e in np.nonzero(done[np.arange(env.E), my_slot])[0]:
+            picks.append(env.pickups[e, my_slot[e]].copy())
         for e in np.nonzero(reset)[0]:
             results.append(ret[e])
             ret[e] = 0.0
             my_slot[e] = rng.integers(0, n_players)
+            setup(e)
     results = np.array(results[:rounds])
+    if stats is not None and picks:
+        picks = np.array(picks)
+        for g, mask in BONUS_GROUPS.items():
+            stats[g] = float(picks[:, mask].sum(1).mean())
     return float(results.mean()), float((results > 0.99).mean())   # win = last survivor
 
 
 @torch.no_grad()
 def record_video(model, n_players, opponent, seed, frame_skip, delay, size_px=240, stride=2, max_seconds=90,
-                 aggression=0.2):
+                 aggression=0.2, human_args=None):
     """Play one round (all bonuses on) and return (frames, info). The model controls a random
-    slot, drawn with a white ring; the others are the model too ('self') or the heuristic."""
+    slot, drawn with a white ring; the others are the model too ('self'), the heuristic, or the
+    model with human-like handicaps ('human')."""
     probs = [0.0] * (n_players - 1)
     probs[-1] = 1.0
     env = BatchEnv(1, max_players=n_players, n_probs=probs, bonus_modes=(0, 1, 0), seed=seed,
                    map_size=model.map_size, global_map=model.global_map, delay=delay, frame_skip=frame_skip,
-                   kill_reward=(aggression, aggression))
+                   kill_reward=(aggression, aggression), **(human_args or {}))
     env.reset()
     me = np.random.default_rng(seed).integers(0, n_players)
+    if opponent == 'human':
+        for p in range(n_players):
+            if p != me:
+                env.make_human(0, p)
     slots = np.arange(n_players)[None, :]
     frames = [render(env.S, 0, size_px, me)]
     ret = 0.0
     kills = 0
+    picks = np.zeros(len(B_AFFECT), np.int64)
     step = 0
     max_steps = int(max_seconds * 60 / frame_skip)
     while step < max_steps:
@@ -170,7 +218,7 @@ def record_video(model, n_players, opponent, seed, frame_skip, delay, size_px=24
         mine = alive & (slots == me)
         others = alive & ~mine
         actions = np.zeros((1, n_players), np.int64)
-        if opponent == 'self':
+        if opponent in ('self', 'human'):
             actions[alive] = policy_moves(model, env, alive)
         else:
             actions[mine] = policy_moves(model, env, mine)
@@ -178,6 +226,8 @@ def record_video(model, n_players, opponent, seed, frame_skip, delay, size_px=24
         _, rew, done, reset = env.step(actions)
         ret += rew[0, me]
         kills += env.kills[0, me]
+        if done[0, me]:
+            picks = env.pickups[0, me].copy()
         step += 1
         if reset[0]:
             break
@@ -186,7 +236,7 @@ def record_video(model, n_players, opponent, seed, frame_skip, delay, size_px=24
     frames += [frames[-1]] * 10   # hold the last frame for a moment
     placement = int(round((ret + 1) / 2 * (n_players - 1)))   # points: 0 = first out, n-1 = survivor
     info = {'seconds': step * frame_skip / 60, 'rank': n_players - placement, 'fps': 60 / (frame_skip * stride),
-            'kills': int(kills)}
+            'kills': int(kills), 'bonuses': int(picks.sum())}
     return frames, info
 
 
@@ -263,8 +313,9 @@ def fmt_num(x):
 
 
 def episode_report(episodes, frame_skip):
-    """Summary lines over recent learner rounds. Each episode is a dict with
-    ctrl, ret, len (decisions), n (players) and cause (-1 survived, 0 wall, 1 own, 2 other)."""
+    """Summary lines over recent learner rounds. Each episode is a dict with mode ('self' or
+    'mixed'), human/heur/pool (opponent kinds present), ret, len (decisions), n (players), cause
+    (-1 survived, 0 wall, 1 own, 2 other), kills, aggr and pickups (per bonus type)."""
     if not episodes:
         return ['  rounds   none finished yet']
     eps = list(episodes)
@@ -278,9 +329,9 @@ def episode_report(episodes, frame_skip):
     secs = arr('len') * frame_skip / 60.0
     lines.append(f"  rounds   last {len(eps)} learner rounds: avg survival {np.mean(secs):.1f}s of game time, "
                  f"avg {np.mean(arr('n')):.1f} players")
-    lines.append(f"  vs self      {res(lambda e: e['ctrl'] == SELF)}")
-    lines.append(f"  vs heuristic {res(lambda e: e['ctrl'] == HEURISTIC)}")
-    lines.append(f"  vs pool      {res(lambda e: e['ctrl'] >= 0)}")
+    lines.append(f"  self-play rounds          {res(lambda e: e['mode'] == 'self')}")
+    lines.append(f"  mixed, with human-like    {res(lambda e: e['mode'] == 'mixed' and e['human'])}")
+    lines.append(f"  mixed, bots/heuristic only {res(lambda e: e['mode'] == 'mixed' and not e['human'])}")
     lines.append('  by size  ' + ' | '.join(
         f"{lo}-{hi}p ret {np.mean(r):+.3f}" if len(r := arr('ret', lambda e, lo=lo, hi=hi: lo <= e['n'] <= hi))
         else f"{lo}-{hi}p n/a" for lo, hi in ((2, 2), (3, 6), (7, 16))))
@@ -295,6 +346,15 @@ def episode_report(episodes, frame_skip):
         lo, hi = (a <= np.median(a)), (a > np.median(a))
         lines.append(f"  kills    {np.mean(k):.2f} per round (opponents crashing into the bot's trail) | "
                      f"low aggression {np.mean(k[lo]):.2f} vs high {np.mean(k[hi]) if hi.any() else float('nan'):.2f}")
+    picks = np.array([e['pickups'] for e in eps])
+    hum = np.array([e['mode'] == 'mixed' and e['human'] for e in eps])
+    if len(picks):
+        def per_round(mask, sel):
+            return f"{picks[sel][:, mask].sum(1).mean():.2f}" if sel.any() else 'n/a'
+        g = BONUS_GROUPS
+        lines.append(f"  bonuses  picked per round: enemy maluses {per_round(g['enemy'], hum)} with human-like "
+                     f"opponents vs {per_round(g['enemy'], ~hum)} without | own bonuses "
+                     f"{per_round(g['self'], np.ones(len(eps), bool))} | game-wide {per_round(g['game'], np.ones(len(eps), bool))}")
     return lines
 
 
@@ -325,31 +385,45 @@ def main():
     bonus_modes = [float(v) for v in args.bonus_modes.split(',')]
     delay = tuple(int(v) for v in args.delay.split(','))
     kill_reward = tuple(float(v) for v in args.kill_reward.split(','))
+    human_delay = tuple(int(v) for v in args.human_delay.split(','))
+    human_args = {'human_delay': human_delay, 'human_noise': args.human_noise,
+                  'human_confusion': args.human_confusion}
     env = BatchEnv(args.num_envs, max_players=args.max_players, n_probs=n_probs,
                    bonus_modes=bonus_modes, frame_skip=args.frame_skip, delay=delay, kill_reward=kill_reward,
-                   seed=args.seed, map_size=args.map_size, global_map=args.global_map)
+                   seed=args.seed, map_size=args.map_size, global_map=args.global_map, **human_args)
     E, P, T, M = env.E, env.P, args.rollout, args.map_size
 
     pool = OpponentPool(args.pool_size, args.active_opponents, make_model)
-    ctrl = np.full(E, SELF, np.int64)
-    learner_slot = np.zeros(E, np.int64)
-    slot_idx = np.arange(P)[None, :]
+    # controller of every player slot: LEARNER (the bot being trained), HEURISTIC, or a pool id;
+    # human-like players (env.S.human) are driven by the heuristic or a pool snapshot
+    ctrl = np.full((E, P), LEARNER, np.int64)
+    mode = ['self'] * E
 
     def assign(envs):
         keys = list(pool.active.keys())
         for e in envs:
-            u = random.random()
-            if u < args.p_self:
-                c = SELF
-            elif u < args.p_self + args.p_heuristic:
-                c = HEURISTIC
-            else:
-                c = random.choice(keys) if keys else SELF
-            ctrl[e] = c
-            learner_slot[e] = random.randrange(int(env.S.n[e]))
+            n = int(env.S.n[e])
+            ctrl[e, :] = LEARNER
+            if random.random() < args.p_selfplay or n < 2:
+                mode[e] = 'self'
+                continue
+            mode[e] = 'mixed'
+            slots = list(range(n))
+            random.shuffle(slots)
+            n_learn = random.randint(1, max(1, int(args.max_learner_share * n)))
+            for p in slots[n_learn:]:
+                snapshot = random.choice(keys) if keys else HEURISTIC
+                u = random.random()
+                if u < args.p_human:
+                    ctrl[e, p] = HEURISTIC if random.random() < args.human_base_heuristic else snapshot
+                    env.make_human(e, p)
+                elif u < args.p_human + args.p_heuristic:
+                    ctrl[e, p] = HEURISTIC
+                else:
+                    ctrl[e, p] = snapshot
 
     def learner_mask(alive):
-        return alive & ((ctrl[:, None] == SELF) | (slot_idx == learner_slot[:, None]))
+        return alive & (ctrl == LEARNER)
 
     n_params = sum(p.numel() for p in model.parameters())
     if device.type == 'cuda':
@@ -366,8 +440,11 @@ def main():
         f"({args.frame_skip * 1000 / 60:.0f} ms), latency {delay[0]}-{delay[1]} frames")
     log(f"  reward      placement (+1 survivor ... -1 first out) + kill bonus {kill_reward[0]}-{kill_reward[1]} "
         f"per kill (sampled per player, observed); evaluations use aggression {args.eval_aggression}")
-    log(f"  opponents   self {args.p_self:.0%} | heuristic {args.p_heuristic:.0%} | "
-        f"pool {max(0.0, 1 - args.p_self - args.p_heuristic):.0%} (snapshot every {args.snapshot_every} updates)")
+    log(f"  opponents   {args.p_selfplay:.0%} self-play rounds; mixed rounds: the bot controls 1 to "
+        f"{args.max_learner_share:.0%} of the players, the others are human-like {args.p_human:.0%} | heuristic "
+        f"{args.p_heuristic:.0%} | past versions {max(0.0, 1 - args.p_human - args.p_heuristic):.0%}")
+    log(f"  human-like  reaction {human_delay[0]}-{human_delay[1]} frames, steering noise {args.human_noise:.0%}, "
+        f"confusion after maluses x{args.human_confusion}; pool snapshot every {args.snapshot_every} updates")
     log(f"  ppo         rollout {T} | gamma {args.gamma} | lambda {args.lam} | lr {args.lr} | "
         f"minibatch {args.minibatch} x {args.epochs} epochs | target {fmt_num(args.total_steps)} steps")
     log(f"  output      {run_dir}  (tensorboard --logdir runs)")
@@ -441,14 +518,15 @@ def main():
             buf_val[t][learner] = value
             buf_valid[t] = learner
             # opponents
-            heur = others & (ctrl[:, None] == HEURISTIC)
+            heur = others & (ctrl == HEURISTIC)
             if heur.any():
                 actions[heur] = env.heuristic(heur, eps=0.3)[heur]
             for k, m in pool.active.items():
-                sel = others & (ctrl[:, None] == k)
+                sel = others & (ctrl == k)
                 if sel.any():
                     actions[sel] = policy_moves(m, env, sel)
-            aggr = env.S.aggr.copy()   # this round's aggression (env may reset during step)
+            aggr = env.S.aggr.copy()     # this round's aggression and human-like players
+            human = env.S.human.copy()   # (copied: the env may reset during the step)
             _, rew, done, reset = env.step(actions)
             buf_rew[t] = rew + env.kill_rew   # learn from placement + kill bonus
             buf_done[t] = done
@@ -457,13 +535,15 @@ def main():
             ep_len += learner
             ep_kills += np.where(learner, env.kills, 0)
             for e, p in zip(*np.nonzero(done & learner)):
-                c = int(ctrl[e])
-                episodes.append({'ctrl': c, 'ret': ep_ret[e, p], 'len': ep_len[e, p],
+                others_ctrl = ctrl[e, :n_round[e]]
+                episodes.append({'mode': mode[e], 'human': bool(human[e].any()),
+                                 'ret': ep_ret[e, p], 'len': ep_len[e, p],
                                  'n': int(n_round[e]), 'cause': int(env.cause[e, p]),
-                                 'kills': ep_kills[e, p], 'aggr': aggr[e, p]})
-                ep_kills[e, p] = 0.0
-                if c >= 0:
+                                 'kills': ep_kills[e, p], 'aggr': aggr[e, p],
+                                 'pickups': env.pickups[e, p].copy()})
+                for c in set(int(c) for c in others_ctrl if c >= 0):
                     pool.record(c, (ep_ret[e, p] + 1.0) / 2.0)   # placement in [0, 1]
+                ep_kills[e, p] = 0.0
                 ep_ret[e, p] = 0.0
                 ep_len[e, p] = 0.0
             if reset.any():
@@ -556,11 +636,15 @@ def main():
         writer.add_scalar('loss/explained_variance', explained_var, total_steps)
         if episodes:
             recent = list(episodes)[-500:]
-            for name, cond in (('self', lambda e: e['ctrl'] == SELF), ('heur', lambda e: e['ctrl'] == HEURISTIC),
-                               ('pool', lambda e: e['ctrl'] >= 0)):
-                r = [e['ret'] for e in recent if cond(e)]
-                if r:
-                    writer.add_scalar(f'train/ret_{name}', np.mean(r), total_steps)
+            for name, cond in (('selfplay', lambda e: e['mode'] == 'self'),
+                               ('with_human', lambda e: e['mode'] == 'mixed' and e['human']),
+                               ('mixed_bots', lambda e: e['mode'] == 'mixed' and not e['human'])):
+                sel = [e for e in recent if cond(e)]
+                if sel:
+                    writer.add_scalar(f'train/ret_{name}', np.mean([e['ret'] for e in sel]), total_steps)
+                    for g, mask in BONUS_GROUPS.items():
+                        writer.add_scalar(f'bonuses/{g}_per_round_{name}',
+                                          np.mean([e['pickups'][mask].sum() for e in sel]), total_steps)
             died = [e['cause'] for e in recent if e['cause'] >= 0]
             if died:
                 for i, name in enumerate(('wall', 'own', 'other')):
@@ -603,18 +687,28 @@ def main():
         if update % args.eval_every == 0:
             model.eval()
             ev = {}
+            picks = {}
             for n_eval in (2, 4, 8):
+                picks[n_eval] = {}
                 ev[f'ret_heur_{n_eval}p'], ev[f'win_heur_{n_eval}p'] = evaluate(
                     model, 'heuristic', args.eval_rounds, seed=update + n_eval, n_players=n_eval, delay=delay,
-                    frame_skip=args.frame_skip, aggression=args.eval_aggression)
+                    frame_skip=args.frame_skip, aggression=args.eval_aggression, stats=picks[n_eval])
+            picks['human'] = {}
+            ev['ret_human_6p'], ev['win_human_6p'] = evaluate(
+                model, 'human', args.eval_rounds, seed=update + 6, n_players=6, delay=delay,
+                frame_skip=args.frame_skip, aggression=args.eval_aggression, human_args=human_args,
+                stats=picks['human'])
+            ev['enemy_maluses_human_6p'] = picks['human'].get('enemy', 0.0)
+            ev['enemy_maluses_heur_4p'] = picks[4].get('enemy', 0.0)
             ref = make_model()
             ref.load_state_dict(pool.entries[max(0, len(pool.entries) - 9)]['state'])
             ref.eval()
             ev['ret_past_6p'], ev['win_past_6p'] = evaluate(
                 model, ref, args.eval_rounds, seed=update + 1, n_players=6, delay=delay,
                 frame_skip=args.frame_skip, aggression=args.eval_aggression)
-            # one number to track: mean round return vs the heuristic over 2, 4 and 8 players
-            ev['score'] = float(np.mean([ev[f'ret_heur_{n}p'] for n in (2, 4, 8)]))
+            # one number to track: mean round return vs the heuristic (2, 4, 8 players) and vs
+            # human-like players (6 players)
+            ev['score'] = float(np.mean([ev[f'ret_heur_{n}p'] for n in (2, 4, 8)] + [ev['ret_human_6p']]))
             for k, v in ev.items():
                 writer.add_scalar(f'eval/{k}', v, total_steps)
             def delta(k, scale=1.0, digits=1):
@@ -625,7 +719,13 @@ def main():
                 log(f"  vs heuristic, {n} players: survives {100 * ev[f'win_heur_{n}p']:5.1f}%"
                     f"{delta(f'win_heur_{n}p', 100)} | ret {ev[f'ret_heur_{n}p']:+.3f}"
                     f"{delta(f'ret_heur_{n}p', digits=3)}")
+            log(f"  vs human-like, 6 players: survives {100 * ev['win_human_6p']:5.1f}%"
+                f"{delta('win_human_6p', 100)} | ret {ev['ret_human_6p']:+.3f}{delta('ret_human_6p', digits=3)}"
+                f"   (the heuristic with human reactions, noise and confusion after maluses)")
             log("  (ret: +1 = always last alive, 0 = average placement, -1 = always first out)")
+            log(f"  bonuses picked per round: enemy maluses {ev['enemy_maluses_human_6p']:.2f} vs human-like (6p)"
+                f" vs {ev['enemy_maluses_heur_4p']:.2f} vs the heuristic (4p) | own bonuses "
+                f"{picks['human'].get('self', 0.0):.2f} | game-wide {picks['human'].get('game', 0.0):.2f} (vs human-like)")
             log(f"  vs itself {8 * args.snapshot_every} updates ago, 6 players: survives "
                 f"{100 * ev['win_past_6p']:5.1f}% | ret {ev['ret_past_6p']:+.3f}   (> 0 means it improved)")
             path = os.path.join(run_dir, 'pool', f'model_{update:05d}.pt')
@@ -642,7 +742,8 @@ def main():
         if video_every and update % video_every == 0:
             model.eval()
             frames, info = record_video(model, args.video_players, args.video_opponent, seed=update,
-                                        frame_skip=args.frame_skip, delay=delay, aggression=args.eval_aggression)
+                                        frame_skip=args.frame_skip, delay=delay, aggression=args.eval_aggression,
+                                        human_args=human_args)
             gif = encode_gif(frames, info['fps'])
             path = os.path.join(run_dir, 'videos', f'round_{update:05d}.gif')
             with open(path, 'wb') as f:
@@ -653,7 +754,7 @@ def main():
                 Summary(value=[Summary.Value(tag='video/sample_round', image=img)]), total_steps)
             log(f"  video    {path}: {args.video_players} players (others: {args.video_opponent}), bot ringed "
                 f"in white finished #{info['rank']} of {args.video_players} after {info['seconds']:.0f}s "
-                f"with {info['kills']} kill(s) "
+                f"with {info['kills']} kill(s) and {info['bonuses']} bonus(es) "
                 f"| tensorboard: Images tab, video/sample_round")
 
     save_policy(os.path.join(run_dir, 'model_final.pt'), model,

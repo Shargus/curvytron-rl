@@ -100,10 +100,27 @@ with a wider range (e.g. `--delay 2,12`).
 
 Each round has 2-13 players (weighted towards 4-13, see `--n-probs`) and a
 random bonus setup: no bonuses, all bonuses (the server default) or a random
-subset. The learner's opponents in a round are either itself (pure self-play,
-60%), the lookahead heuristic (10%), or a past snapshot from the pool, sampled
-with prioritized fictitious self-play (snapshots it does worse against are picked
-more). The reward follows Curvytron scoring: an avatar dying k-th gets k points,
+subset. 35% of the rounds are pure self-play: every player is the current bot
+(`--p-selfplay`). In the other rounds the bot controls one up to a third of the
+players, and each other player is (`--p-human`, `--p-heuristic`):
+
+* human-like (45%): the heuristic or a past version of the bot, with human
+  handicaps: a reaction delay of 150-300 ms (`--human-delay`), occasional steering
+  noise (`--human-noise`), and confusion when a malus changes its controls, i.e. a
+  high chance of steering wrong right after inverted controls, 90 degree turns,
+  a speed-up, growing or a borderless board, fading over 1-2.5 s
+  (`--human-confusion` scales it, table in `curvysim/env.py`)
+* the lookahead heuristic (20%)
+* a past version of the bot (35%), from a pool sampled with prioritized fictitious
+  self-play (versions it does worse against are picked more)
+
+Bot opponents shrug off enemy maluses (they adapt within 50 ms), humans do not.
+The bot sees which opponents are human-like, so it can learn to use maluses
+against humans without wasting effort on them against bots; when playing,
+`--opponents human` (default) or `bots` sets what it is told. The progress log and
+tensorboard (`bonuses/...`) show bonuses picked per round with and without
+human-like opponents, and evaluations add a 6-player game against human-like
+heuristics (also part of the score that selects `model_best.pt`). The reward follows Curvytron scoring: an avatar dying k-th gets k points,
 the survivor n-1, and the return of a round is `2 * points / (n - 1) - 1`
 (+1 for the survivor, -1 for the first out).
 
@@ -190,6 +207,7 @@ what a player does in the browser:
 * `/kick <player>` to vote (or kick directly as room master), `/votes`, `/players`
 * `/name`, `/color`, `/greedy on|off`, `/status` (role, latency, rounds won), `/quit`
 * `/aggression [x]`: show or change how much the bot hunts (also `--aggression` at start)
+* `/opponents human|bots`: what the bot is told about the other players (default human)
 * as room master: `/launch`, `/maxscore`, `/bonuses`, `/bonus <name>`, `/bonusrate`, `/open on|off`
 
 If a game is already running when the bot arrives, it watches and joins the

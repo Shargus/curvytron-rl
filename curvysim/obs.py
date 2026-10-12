@@ -13,6 +13,8 @@ Observation layout (all roughly in [-1, 2]):
     self      N_SELF       : own state, effects, timers, latency, aggression, last moves sent
     lookahead N_LOOK       : survival of each move under a short tree search (2 horizons)
     territory N_TERR       : share of the board reachable first, now and after each move
+    humans    N_HUMAN      : which of the nearest opponents are human-like, share of human-like
+                           opponents alive (last, so older models can be extended with zero weights)
 """
 import math
 
@@ -35,7 +37,8 @@ F_BON = 7 + NB      # valid, distance, direction (2), path: reachable, length, f
 N_SELF = 23 + NB + 2 + 3 * HIST
 N_LOOK = 12        # lookahead search features (see lookahead_features)
 N_TERR = 12        # territory features (see territory_features)
-OBS_DIM = N_RAYS * 3 + K_OPP * F_OPP + K_BON * F_BON + N_SELF + N_LOOK + N_TERR
+N_HUMAN = K_OPP + 1   # opponents flagged human-like (same order as the opponent block) + share
+OBS_DIM = N_RAYS * 3 + K_OPP * F_OPP + K_BON * F_BON + N_SELF + N_LOOK + N_TERR + N_HUMAN
 OWN_SKIP = TRAIL_LATENCY + 2   # newest own bodies ignored by the rays
 HEAD_MARGIN = 2.0              # heuristic: clearance kept from opponents' heads
 
@@ -206,6 +209,19 @@ def write_obs(S, e, p, out):
     lookahead_features(S, e, p, out, o)
     o += N_LOOK
     territory_features(S, e, p, out, o, o_bon, border, bd)
+    o += N_TERR
+    n_opp = 0
+    n_hum = 0
+    for q in range(n):
+        if q != p and S.alive[e, q]:
+            n_opp += 1
+            if S.human[e, q]:
+                n_hum += 1
+    for k in range(K_OPP):
+        out[o + k] = 0.0
+        if k < n and dists[order[k]] < 1e8 and S.human[e, order[k]]:
+            out[o + k] = 1.0
+    out[o + K_OPP] = n_hum / max(n_opp, 1)
 
 
 @nb.njit(parallel=True, cache=True)

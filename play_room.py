@@ -48,6 +48,7 @@ commands (anything not starting with / is sent to the chat):
   /play                      add the bot back as a player
   /greedy on|off             bot picks its most likely move (on) or samples (off, default)
   /aggression [x]            hunting vs surviving: kill bonus the bot plays for (0 = only survive)
+  /opponents human|bots      tell the bot whether the other players are humans (default) or bots
   /status                    connection, latency, game state and the bot's record
   /quit                      leave the room and exit
 room master only:
@@ -346,7 +347,7 @@ class Console:
     def run(self):
         names = lambda: [p['name'] for p in self.bot.players.values()]
         commands = ['/help', '/players', '/ready', '/auto', '/kick', '/votes', '/name', '/color', '/spectate',
-                    '/play', '/greedy', '/aggression', '/status', '/quit', '/launch', '/maxscore', '/bonuses', '/bonus',
+                    '/play', '/greedy', '/aggression', '/opponents', '/status', '/quit', '/launch', '/maxscore', '/bonuses', '/bonus',
                     '/bonusrate', '/open']
         session = PromptSession()
         print('type /help for the commands; plain text goes to the chat')
@@ -452,6 +453,10 @@ class Console:
             bot.aggression = float(arg)
             note = '' if lo <= bot.aggression <= hi else f' (outside the trained range {lo}-{hi}!)'
             return f'aggression set to {bot.aggression}{note}'
+        if cmd == '/opponents':
+            if arg in ('human', 'bots'):
+                bot.opponents_human = arg == 'human'
+            return f"the bot treats the other players as {'humans' if bot.opponents_human else 'bots'}"
         if cmd == '/greedy':
             bot.greedy = arg == 'on'
             return f"greedy {'on' if bot.greedy else 'off'}"
@@ -460,7 +465,8 @@ class Console:
             return (f'room "{bot.room}" | the bot is {role} as {bot.name} ({bot.color}) | '
                     f"{'game running' if bot.in_game else 'in the lobby'} | latency {bot.rtt_ms:.0f} ms | "
                     f'rounds won {bot.wins}/{bot.rounds} | auto-ready {"on" if bot.auto_ready else "off"} | '
-                    f'aggression {bot.aggression}')
+                    f'aggression {bot.aggression} | opponents treated as '
+                    f"{'humans' if bot.opponents_human else 'bots'}")
         # room master
         master_cmds = ('/launch', '/maxscore', '/bonuses', '/bonus', '/bonusrate', '/open')
         if cmd in master_cmds and cmd != '/bonuses' and not bot.is_master():
@@ -499,6 +505,8 @@ def main():
     ap.add_argument('--greedy', action='store_true', help='most likely move instead of sampling')
     ap.add_argument('--auto-ready', action='store_true',
                     help='get ready automatically on joining and after each game (also /auto on)')
+    ap.add_argument('--opponents', default='human', choices=['human', 'bots'],
+                    help='tell the bot whether the other players are humans (default) or bots')
     ap.add_argument('--aggression', type=float, default=None,
                     help='hunting vs surviving: kill bonus the bot plays for (default 0.2, 0 = only survive)')
     args = ap.parse_args()
@@ -535,7 +543,7 @@ def main():
     if not lo <= aggression <= hi:
         print(f'note: aggression {aggression} is outside the trained range {lo}-{hi}')
     bot = RoomBot(model, room, password, decide_every=decide_every, greedy=args.greedy, aggression=aggression,
-                  name=name, color=color)
+                  opponents_human=args.opponents == 'human', name=name, color=color)
     bot.trained_aggression = (lo, hi)
     bot.auto_ready = args.auto_ready
     print('compiling the bot (first time ~1 min, then cached) ...')

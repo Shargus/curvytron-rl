@@ -104,9 +104,29 @@ def save_policy(path, model, extra=None):
     torch.save({'config': model.config, 'state_dict': state, **(extra or {})}, path)
 
 
+def expand_obs_inputs(state_dict, config, new_dim):
+    """Adapt a checkpoint trained with fewer features (new ones are appended at the end of
+    the observation) to ``new_dim``: the extra input weights are zero, so the network behaves
+    exactly as before until training teaches it to use them."""
+    old_dim = config['obs_dim']
+    state_dict = dict(state_dict)
+    first = (['trunk.0.weight'] if config.get('map_size', 0) > 0 or config.get('global_map')
+             else ['pi_body.0.weight', 'v_body.0.weight'])
+    for key in first:
+        w = state_dict[key]
+        extra = torch.zeros(w.shape[0], new_dim - old_dim, dtype=w.dtype)
+        # observation first, then the map embeddings (shared trunk)
+        state_dict[key] = torch.cat([w[:, :old_dim], extra, w[:, old_dim:]], dim=1)
+    return state_dict, {**config, 'obs_dim': new_dim}
+
+
 def load_policy(path, map_location='cpu'):
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
-    model = ActorCritic(**ckpt['config'])
-    model.load_state_dict(ckpt['state_dict'])
+    config, state = ckpt['config'], ckpt['state_dict']
+    if config['obs_dim'] < OBS_DIM:
+        state, config = expand_obs_inputs(state, config, OBS_DIM)
+        ckpt = {**ckpt, 'config': config, 'state_dict': state, 'expanded_from': ckpt['config']['obs_dim']}
+    model = ActorCritic(**config)
+    model.load_state_dict(state)
     model.eval()
     return model, ckpt

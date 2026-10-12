@@ -220,10 +220,11 @@ class Mirror:
 
 
 class CurvyBot(client.CurvytronClient):
-    def __init__(self, model, decide_every=2, greedy=False, aggression=0.2, **kwargs):
+    def __init__(self, model, decide_every=2, greedy=False, aggression=0.2, opponents_human=True, **kwargs):
         super().__init__(**kwargs)
         self.model = model
         self.aggression = aggression   # kill bonus the policy plays for (0 = pure survival)
+        self.opponents_human = opponents_human   # tell the policy the other players are humans
         self.decide_every = decide_every
         self.greedy = greedy
         self.mirror = Mirror()
@@ -326,6 +327,8 @@ class CurvyBot(client.CurvytronClient):
         S.t[0] = self.mirror.now()
         self.mirror.set_latency(p, self.rtt_ms + self.extra_delay_ms, self.sent, self.decisions)
         S.aggr[0, p] = self.aggression
+        S.human[0, :] = self.opponents_human
+        S.human[0, p] = False
         write_obs(S, 0, p, self.obs)
         maps = None
         if self.map is not None:
@@ -357,6 +360,8 @@ def main():
     ap.add_argument('--decide-every', type=int, default=None,
                     help='server frames per decision (default: the frame skip used in training)')
     ap.add_argument('--greedy', action='store_true', help='argmax actions instead of sampling')
+    ap.add_argument('--opponents', default='human', choices=['human', 'bots'],
+                    help='tell the bot whether the other players are humans (default) or bots')
     ap.add_argument('--aggression', type=float, default=0.2,
                     help='hunting vs surviving: kill bonus the bot plays for (trained range, default 0-1)')
     ap.add_argument('--games', type=int, default=1, help='games to play before exiting (0 = forever)')
@@ -368,6 +373,7 @@ def main():
     model, ckpt = load_policy(args.model)
     decide_every = args.decide_every or ckpt.get('args', {}).get('frame_skip', 3)
     bot = CurvyBot(model, decide_every=decide_every, greedy=args.greedy, aggression=args.aggression,
+                   opponents_human=args.opponents == 'human',
                    name=args.name, color=args.color)
     bot.warmup()
     bot.start()

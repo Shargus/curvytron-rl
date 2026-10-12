@@ -86,6 +86,8 @@ SimState = namedtuple('SimState', [
     'ftype', 'fmask', 'fend',
     # latency model: per player delay (frames), queued moves, last decisions
     'delay', 'sched', 'hist',
+    # human-like players (handicapped controls, see env.py) and bonus pickups per round
+    'human', 'conf_flip', 'conf_p0', 'conf_end', 'conf_dur', 'pickups',
 ])
 
 
@@ -112,6 +114,8 @@ def make_state(E, P=MAX_PLAYERS):
         bx=z((E, BONUS_CAP), f64), by=z((E, BONUS_CAP), f64), btype=np.full((E, BONUS_CAP), -1, i32),
         ftype=np.full((E, MAX_FX), -1, i32), fmask=z((E, MAX_FX), i32), fend=z((E, MAX_FX), f64),
         delay=z((E, P), i32), sched=np.full((E, P, RING), NO_MOVE, i8), hist=z((E, P, HIST), i8),
+        human=z((E, P), b), conf_flip=z((E, P), b), conf_p0=z((E, P), f64), conf_end=z((E, P), f64),
+        conf_dur=z((E, P), f64), pickups=z((E, P, NB), i32),
     )
 
 
@@ -419,6 +423,7 @@ def catch_bonus(S, e, p):
         dy = S.by[e, b] - y
         if dx * dx + dy * dy < rs * rs:
             S.btype[e, b] = -1
+            S.pickups[e, p, t] += 1
             aff = B_AFFECT[t]
             if t == B_CLEAR:
                 clear_world(S, e)
@@ -544,6 +549,13 @@ def reset_env(S, e, n, enabled):
         S.death_t[e, p] = 0.0
         S.cause[e, p] = -1
         S.killer[e, p] = -1
+        S.human[e, p] = False
+        S.conf_flip[e, p] = False
+        S.conf_p0[e, p] = 0.0
+        S.conf_end[e, p] = 0.0
+        S.conf_dur[e, p] = 1.0
+        for t in range(NB):
+            S.pickups[e, p, t] = 0
         for k in range(RING):
             S.sched[e, p, k] = NO_MOVE
         for k in range(HIST):
