@@ -235,8 +235,10 @@ class CurvytronClient(threading.Thread):
         else:
             protocol = 'ws'     # use regular websocket for localhost or other non-secure servers
         
-        # Connect to the curvytron server
-        self.ws.connect(f'{protocol}://{server}')
+        # Connect to the curvytron server. The receive thread sets a 0.05 s socket timeout for its
+        # loop, far too short for a TLS handshake over the internet: use a separate one here.
+        self.ws.connect(f'{protocol}://{server}', timeout=15)
+        self.ws.settimeout(0.05)
         self.connected = True
         
         # Request client ID from server

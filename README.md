@@ -109,7 +109,7 @@ the survivor n-1, and the return of a round is `2 * points / (n - 1) - 1`
 
 On top of that, a player whose trail kills an opponent gets a kill bonus
 ("aggression", hunting vs surviving). Each player draws its own bonus per round
-from `--kill-reward` (default 0-0.6) and sees it as an input, so a single trained
+from `--kill-reward` (default 0-1) and sees it as an input, so a single trained
 model learns the whole range of play styles and you choose one when playing
 (`--aggression`, default 0.2, which favours surviving; 0 = survive only). For scale:
 a duel is worth +-1, and in a 10-player round every opponent death already gives
@@ -184,8 +184,9 @@ joins the room and plays every game on its own, while the console lets you do
 what a player does in the browser:
 
 * plain text is sent to the room chat, and the chat is shown in the console
-* `/ready`, `/auto on|off` (auto-ready, only once another player is in the room, so
-  the bot never starts solo games that lock others out), `/spectate`, `/play`
+* `/ready`, `/auto on|off` (auto-ready: off by default, `--auto-ready` to start with it on;
+  it only gets ready once another player is in the room, so the bot never starts solo
+  games that lock others out), `/spectate`, `/play`
 * `/kick <player>` to vote (or kick directly as room master), `/votes`, `/players`
 * `/name`, `/color`, `/greedy on|off`, `/status` (role, latency, rounds won), `/quit`
 * `/aggression [x]`: show or change how much the bot hunts (also `--aggression` at start)

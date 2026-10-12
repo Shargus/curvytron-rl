@@ -18,6 +18,7 @@ from collections import deque
 
 import numpy as np
 import torch
+import websocket
 
 import client
 from curvysim import core
@@ -261,7 +262,7 @@ class CurvyBot(client.CurvytronClient):
     def run(self):
         try:
             super().run()
-        except OSError:
+        except (OSError, websocket.WebSocketException):
             if self.alive.is_set():   # errors after join() are just the socket closing
                 raise
 
@@ -357,7 +358,7 @@ def main():
                     help='server frames per decision (default: the frame skip used in training)')
     ap.add_argument('--greedy', action='store_true', help='argmax actions instead of sampling')
     ap.add_argument('--aggression', type=float, default=0.2,
-                    help='hunting vs surviving: kill bonus the bot plays for (trained range, default 0-0.6)')
+                    help='hunting vs surviving: kill bonus the bot plays for (trained range, default 0-1)')
     ap.add_argument('--games', type=int, default=1, help='games to play before exiting (0 = forever)')
     ap.add_argument('--wait-players', type=int, default=2,
                     help='only get ready once the room has this many players')

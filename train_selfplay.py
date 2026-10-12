@@ -45,7 +45,7 @@ def parse_args():
     p.add_argument('--bonus-modes', default='0.3,0.4,0.3', help='P(no bonus), P(all), P(random subset)')
     p.add_argument('--frame-skip', type=int, default=3, help='server frames per decision (3 = 50 ms)')
     p.add_argument('--delay', default='0,8', help='round-trip latency range in frames (1 frame = 16.7 ms)')
-    p.add_argument('--kill-reward', default='0,0.6',
+    p.add_argument('--kill-reward', default='0,1',
                    help='range of the per-kill bonus ("aggression"), sampled per player and round and '
                         'observed by the bot, so the play style can be chosen when playing')
     p.add_argument('--eval-aggression', type=float, default=0.2,

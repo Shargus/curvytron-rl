@@ -134,7 +134,7 @@ class BatchEnv:
     """
 
     def __init__(self, num_envs, max_players=12, n_probs=None, bonus_modes=(0.3, 0.4, 0.3),
-                 bonus_p=0.5, frame_skip=2, delay=(0, 8), kill_reward=(0.0, 0.6), jitter_ms=1.0, max_round_s=150.0, seed=0,
+                 bonus_p=0.5, frame_skip=2, delay=(0, 8), kill_reward=(0.0, 1.0), jitter_ms=1.0, max_round_s=150.0, seed=0,
                  map_size=0, global_map=False):
         assert 2 <= max_players <= MAX_PLAYERS
         self.E = num_envs

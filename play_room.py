@@ -38,7 +38,8 @@ commands (anything not starting with / is sent to the chat):
   /help                      this help
   /players                   players in the room (ready state, scores, room master)
   /ready                     toggle the bot's ready state
-  /auto on|off               get ready automatically, once another player is in the room (default on)
+  /auto on|off               get ready automatically (on joining and after each game), once another
+                             player is in the room (default off, or --auto-ready)
   /kick <player>             vote to kick a player (again to withdraw); the room master kicks directly
   /votes                     ongoing kick votes
   /name <new name>           change the bot's nickname
@@ -68,7 +69,12 @@ def parse_room(text):
     host = url.netloc or 'curvytron.com'
     frag = url.fragment or url.path              # '#/room/<name>?password=...'
     path, _, query = frag.partition('?')
-    room = unquote(path.split('/room/', 1)[1]).strip('/')
+    room = path.split('/room/', 1)[1].strip('/')
+    for _ in range(3):   # the browser shows names encoded twice (space -> %2520)
+        decoded = unquote(room)
+        if decoded == room:
+            break
+        room = decoded
     password = parse_qs(query or url.query).get('password', [None])[0]
     server = 'curvytron.com' if 'curvytron.com' in host else host
     return server, room, password
@@ -120,7 +126,7 @@ class RoomBot(CurvyBot):
         self.config = {}
         self.votes = {}          # target player id -> result
         self.in_game = False
-        self.auto_ready = True
+        self.auto_ready = False
         self.want_play = True
         self.request_lock = threading.Lock()
 
@@ -440,7 +446,7 @@ class Console:
         if cmd == '/play':
             return bot.add_player() or 'the bot joined the players'
         if cmd == '/aggression':
-            lo, hi = getattr(bot, 'trained_aggression', (0.0, 0.6))
+            lo, hi = getattr(bot, 'trained_aggression', (0.0, 1.0))
             if not arg:
                 return f'aggression {bot.aggression} (trained range {lo}-{hi}; 0 = only survive)'
             bot.aggression = float(arg)
@@ -491,6 +497,8 @@ def main():
     ap.add_argument('--name', help='nickname of the bot')
     ap.add_argument('--color', help='colour of the bot, #rrggbb')
     ap.add_argument('--greedy', action='store_true', help='most likely move instead of sampling')
+    ap.add_argument('--auto-ready', action='store_true',
+                    help='get ready automatically on joining and after each game (also /auto on)')
     ap.add_argument('--aggression', type=float, default=None,
                     help='hunting vs surviving: kill bonus the bot plays for (default 0.2, 0 = only survive)')
     args = ap.parse_args()
@@ -522,13 +530,14 @@ def main():
     torch.set_num_threads(1)
     model, ckpt = load_policy(model_path)
     decide_every = ckpt.get('args', {}).get('frame_skip', 3)
-    lo, hi = (float(v) for v in str(ckpt.get('args', {}).get('kill_reward', '0,0.6')).split(','))
+    lo, hi = (float(v) for v in str(ckpt.get('args', {}).get('kill_reward', '0,1')).split(','))
     aggression = 0.2 if args.aggression is None else args.aggression
     if not lo <= aggression <= hi:
         print(f'note: aggression {aggression} is outside the trained range {lo}-{hi}')
     bot = RoomBot(model, room, password, decide_every=decide_every, greedy=args.greedy, aggression=aggression,
                   name=name, color=color)
     bot.trained_aggression = (lo, hi)
+    bot.auto_ready = args.auto_ready
     print('compiling the bot (first time ~1 min, then cached) ...')
     bot.warmup()
 
@@ -541,8 +550,13 @@ def main():
         raise SystemExit(f'could not join room "{room}": {err}')
     print(f'joined room "{room}" ({len(bot.players)} players)')
     err = bot.add_player()
-    print(f'[bot] {err}' if err else f'[bot] playing as {bot.name}'
-          + ('' if len(bot.players) >= 2 else ', will get ready when another player joins'))
+    if err:
+        print(f'[bot] {err}')
+    elif not bot.auto_ready:
+        print(f'[bot] playing as {bot.name}, not ready: type /ready (or /auto on to stay ready after each game)')
+    else:
+        print(f'[bot] playing as {bot.name}'
+              + ('' if len(bot.players) >= 2 else ', will get ready when another player joins'))
     try:
         Console(bot).run()
     finally:
