@@ -186,15 +186,19 @@ def add_body(S, e, p, x, y):
             cy = (j + 0.5) * RASTER_RES - y
             if cx * cx + cy * cy <= rr:
                 S.raster[e, i, j] = k
-    # coarse whole-board grid: owner of the latest body touching each cell
+    # coarse whole-board grid: owner of the latest body touching each cell. Only cells the disc
+    # really overlaps (not its bounding box), so that trail holes stay open on the grid
     cs = S.size[e] / GRID
     i0 = _clampi(int(math.floor((x - r) / cs)), 0, GRID - 1)
     i1 = _clampi(int(math.floor((x + r) / cs)), 0, GRID - 1)
     j0 = _clampi(int(math.floor((y - r) / cs)), 0, GRID - 1)
     j1 = _clampi(int(math.floor((y + r) / cs)), 0, GRID - 1)
     for i in range(i0, i1 + 1):
+        dx = max(i * cs - x, 0.0, x - (i + 1) * cs)
         for j in range(j0, j1 + 1):
-            S.gown[e, i, j] = p
+            dy = max(j * cs - y, 0.0, y - (j + 1) * cs)
+            if dx * dx + dy * dy < r * r:
+                S.gown[e, i, j] = p
 
 
 @nb.njit(cache=True)

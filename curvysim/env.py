@@ -22,7 +22,8 @@ import numpy as np
 
 from . import core
 from .core import (NB, FRAME_MS, MAX_PLAYERS, make_state, reset_env, step_frame, potential_score,
-                   queue_move, apply_queued, borderless)
+                   queue_move, apply_queued, borderless, add_body, random_point, direction_valid,
+                   BASE_R, HOLE_DIST, PRINT_DELAY, SPAWN_MARGIN, SPAWN_ANGLE_MARGIN)
 
 # confusion of human-like players when a malus changes their controls:
 # (flip = press the opposite direction instead of a random one, error probability right after the
@@ -63,6 +64,8 @@ def _humanize(S, e, p, move, noise):
             else:
                 move = np.random.randint(-1, 2)
     return move
+
+
 from .obs import OBS_DIM, MAP_CHANNELS, GLOBAL_CHANNELS, compute_obs, compute_maps, compute_globals, heuristic_actions
 
 
@@ -98,6 +101,103 @@ def _new_round(S, e, n_cdf, bonus_mode_cdf, bonus_p, delay_lo, delay_hi, kill_lo
         S.delay[e, p] = np.random.randint(delay_lo, delay_hi + 1)
         # aggression: this player's bonus for each opponent killed on its trail (also observed)
         S.aggr[e, p] = kill_lo + np.random.random() * (kill_hi - kill_lo)
+
+
+@nb.njit(cache=True)
+def _trap(S, e, p, p_own, out):
+    """Turn the fresh round of env ``e`` into a trap for player ``p``: a closed, wobbly trail
+    around it with one or two holes of the usual length, the only ways out. The trail is p's
+    own (an old spiral) with probability ``p_own``, else an opponent's. Trails start printing
+    right away. Writes (centre x, centre y, outer radius) to ``out``."""
+    size = S.size[e]
+    n = S.n[e]
+    R = 9.0 + np.random.random() * (min(22.0, size / 4.0) - 9.0)
+    a1 = np.random.random() * 0.15
+    a2 = np.random.random() * 0.15
+    f1 = np.random.random() * 2 * math.pi
+    f2 = np.random.random() * 2 * math.pi
+    rmax = R * (1.0 + a1 + a2)
+    margin = rmax + 3.0
+    cx = random_point(size, margin)
+    cy = random_point(size, margin)
+    oa = np.random.random() * 2 * math.pi
+    od = np.random.random() * 0.3 * R
+    S.x[e, p] = cx + od * math.cos(oa)
+    S.y[e, p] = cy + od * math.sin(oa)
+    S.ang[e, p] = np.random.random() * 2 * math.pi
+    # opponents spawned on or inside the ring move out of it
+    smargin = BASE_R + SPAWN_MARGIN * size
+    for q in range(n):
+        if q == p:
+            continue
+        for _ in range(1000):
+            if (S.x[e, q] - cx) ** 2 + (S.y[e, q] - cy) ** 2 > (rmax + 6.0) ** 2:
+                break
+            S.x[e, q] = random_point(size, smargin)
+            S.y[e, q] = random_point(size, smargin)
+        a = np.random.random() * 2 * math.pi
+        for _ in range(1000):
+            if direction_valid(size, a, S.x[e, q], S.y[e, q], SPAWN_ANGLE_MARGIN * size):
+                break
+            a = np.random.random() * 2 * math.pi
+        S.ang[e, q] = a
+    owner = p
+    if np.random.random() >= p_own:
+        owner = np.random.randint(n - 1)
+        if owner >= p:
+            owner += 1
+    # ring length (fine polyline), then bodies every BASE_R of arc, skipping the holes
+    steps = 2000
+    length = 0.0
+    px = cx + R * (1.0 + a1 * math.cos(f1) + a2 * math.cos(f2))
+    py = cy
+    for k in range(1, steps + 1):
+        th = 2 * math.pi * k / steps
+        r = R * (1.0 + a1 * math.cos(th + f1) + a2 * math.cos(2 * th + f2))
+        x = cx + r * math.cos(th)
+        y = cy + r * math.sin(th)
+        length += math.sqrt((x - px) ** 2 + (y - py) ** 2)
+        px = x
+        py = y
+    n_holes = 1 if np.random.random() < 0.7 else 2
+    h0 = np.empty(2)
+    h1 = np.empty(2)
+    for h in range(n_holes):
+        h0[h] = np.random.random() * length
+        h1[h] = h0[h] + HOLE_DIST * (0.8 + np.random.random() * 0.5)
+    s = 0.0
+    last = -1e9
+    px = cx + R * (1.0 + a1 * math.cos(f1) + a2 * math.cos(f2))
+    py = cy
+    for k in range(steps):
+        th = 2 * math.pi * k / steps
+        r = R * (1.0 + a1 * math.cos(th + f1) + a2 * math.cos(2 * th + f2))
+        x = cx + r * math.cos(th)
+        y = cy + r * math.sin(th)
+        s += math.sqrt((x - px) ** 2 + (y - py) ** 2)
+        px = x
+        py = y
+        hole = False
+        for h in range(n_holes):
+            # a hole can wrap past the ring's start
+            if (h0[h] <= s < h1[h]) or (s < h1[h] - length):
+                hole = True
+        if not hole and s - last >= BASE_R:
+            add_body(S, e, owner, x, y)
+            last = s
+    S.has_tl[e, owner] = False
+    # skip the 3 s without trails: the trap only works once everybody prints
+    S.next_pop[e] += PRINT_DELAY - FRAME_MS - S.t[e]
+    S.t[e] = PRINT_DELAY - FRAME_MS
+    out[0] = cx
+    out[1] = cy
+    out[2] = rmax
+
+
+@nb.njit(cache=True)
+def _trap_all(S, envs, slots, p_own, out):
+    for i in range(envs.shape[0]):
+        _trap(S, envs[i], slots[i], p_own, out[i])
 
 
 @nb.njit(parallel=True, cache=True)
@@ -285,6 +385,27 @@ class BatchEnv:
                   self.rew, self.kill_rew, self.kills, self.done, self.cause, self.pickups, self.reset_flag,
                   self.P, self.human_noise, self.human_confusion)
         return self.observe(), self.rew, self.done, self.reset_flag
+
+    def trap(self, envs, slots, p_own=0.5):
+        """Rebuild the just-reset rounds ``envs`` as traps for players ``slots`` (see ``_trap``).
+        Call ``refresh(envs)`` afterwards. Returns [len(envs), 3]: ring centre x, y and radius."""
+        envs = np.ascontiguousarray(envs, dtype=np.int64)
+        info = np.zeros((len(envs), 3))
+        if len(envs):
+            _trap_all(self.S, envs, np.ascontiguousarray(slots, dtype=np.int64), float(p_own), info)
+        return info
+
+    def refresh(self, envs):
+        """Recompute the observations of ``envs`` after their state was changed from outside."""
+        if len(envs) == 0:
+            return
+        mask = np.zeros((self.E, self.P), np.bool_)
+        mask[envs] = self.alive[envs]
+        compute_obs(self.S, self.obs, mask)
+        if self.maps is not None:
+            compute_maps(self.S, self.maps, mask)
+        if self.gmaps is not None:
+            compute_globals(self.S, self.gmaps, mask)
 
     def heuristic(self, mask, eps=0.3):
         out = np.zeros((self.E, self.P), np.int64)

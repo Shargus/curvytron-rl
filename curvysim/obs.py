@@ -39,6 +39,7 @@ N_LOOK = 12        # lookahead search features (see lookahead_features)
 N_TERR = 12        # territory features (see territory_features)
 N_HUMAN = K_OPP + 1   # opponents flagged human-like (same order as the opponent block) + share
 OBS_DIM = N_RAYS * 3 + K_OPP * F_OPP + K_BON * F_BON + N_SELF + N_LOOK + N_TERR + N_HUMAN
+O_TERR = OBS_DIM - N_HUMAN - N_TERR   # territory block: [0] share of free board reached first
 OWN_SKIP = TRAIL_LATENCY + 2   # newest own bodies ignored by the rays
 HEAD_MARGIN = 2.0              # heuristic: clearance kept from opponents' heads
 
@@ -502,7 +503,11 @@ def _cell(S, e, x, y):
 
 @nb.njit(cache=True)
 def _bfs(S, e, src_i, src_j, nsrc, dist, queue, bless):
-    """Multi-source BFS (4-neighbourhood) over free cells of S.gown; sources are always free."""
+    """Multi-source BFS (8-neighbourhood) over free cells of S.gown; sources are always free.
+
+    Diagonal steps let paths through trail holes that a trail crossing the grid diagonally
+    leaves open only at a cell corner. A continuous trail always blocks a 4-connected chain
+    of cells, which no 8-connected path can cross, so solid trails stay closed."""
     for i in range(GRID):
         for j in range(GRID):
             dist[i, j] = INF
@@ -521,9 +526,11 @@ def _bfs(S, e, src_i, src_j, nsrc, dist, queue, bless):
         i = c // GRID
         j = c % GRID
         d = dist[i, j] + 1
-        for k in range(4):
-            ni = i + (1 if k == 0 else (-1 if k == 1 else 0))
-            nj = j + (1 if k == 2 else (-1 if k == 3 else 0))
+        for k in range(9):
+            if k == 4:
+                continue
+            ni = i + k // 3 - 1
+            nj = j + k % 3 - 1
             if bless:
                 ni %= GRID
                 nj %= GRID

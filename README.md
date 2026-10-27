@@ -34,13 +34,6 @@ while not episode_over:
 print("done")
 ```
 
-## TODO
-
-* adapt client for step-by-step version of curvytron
-    * Need to handle more message passing, probably want something equivalent to only taking every Nth frame
-* add message handling for room close, player leaving etc.
-* add the other methods and attributes required to make this a full gym environment.
-
 ## Training a strong bot (curvysim + self-play PPO)
 
 Training through the websocket server runs at wall-clock speed (60 frames/s per
@@ -100,8 +93,9 @@ with a wider range (e.g. `--delay 2,12`).
 
 Each round has 2-13 players (weighted towards 4-13, see `--n-probs`) and a
 random bonus setup: no bonuses, all bonuses (the server default) or a random
-subset. 35% of the rounds are pure self-play: every player is the current bot
-(`--p-selfplay`). In the other rounds the bot controls one up to a third of the
+subset. 20% of the rounds have a league exploiter (`--p-exploit`, see below). Of
+the others, 35% are pure self-play: every player is the current bot
+(`--p-selfplay`). The rest are mixed: the bot controls one up to a third of the
 players, and each other player is (`--p-human`, `--p-heuristic`):
 
 * human-like (45%): the heuristic or a past version of the bot, with human
@@ -120,7 +114,9 @@ against humans without wasting effort on them against bots; when playing,
 `--opponents human` (default) or `bots` sets what it is told. The progress log and
 tensorboard (`bonuses/...`) show bonuses picked per round with and without
 human-like opponents, and evaluations add a 6-player game against human-like
-heuristics (also part of the score that selects `model_best.pt`). The reward follows Curvytron scoring: an avatar dying k-th gets k points,
+heuristics (also part of the score that selects `model_best.pt`).
+
+The reward follows Curvytron scoring: an avatar dying k-th gets k points,
 the survivor n-1, and the return of a round is `2 * points / (n - 1) - 1`
 (+1 for the survivor, -1 for the first out).
 
@@ -133,6 +129,25 @@ a duel is worth +-1, and in a 10-player round every opponent death already gives
 each survivor +0.22. Evaluations and logged returns measure placement only (at
 aggression `--eval-aggression`, default 0.2); the progress log also shows kills
 per round, split by low and high aggression.
+
+Three additions push the bot away from simply circling in a safe corner:
+
+- **League exploiters** (`--exploiters`, default 2; `--p-exploit`, default 20% of
+  rounds). An exploiter is a copy of the main agent that trains only in rounds
+  against the current main agent, taking one slot (up to a third of the slots in
+  big rounds) with a higher aggression (`--exploiter-kill-reward`, default 0.6-1.2).
+  Once its placement score against the main agent reaches `--exploiter-target`
+  (default 0.65), or after `--exploiter-max-age` updates, a frozen copy joins the
+  opponent pool and the exploiter restarts from the latest main agent.
+- **Trap rounds** (`--p-trap`, default 15%). The round starts with the learner
+  enclosed by a closed trail, its own or an opponent's (`--trap-own`), whose only
+  ways out are one or two holes of the usual length. Trails print from the first frame.
+- **Territory shaping** (`--territory-coef`, default 0.5). A potential-based term
+  `coef * (gamma * phi' - phi)`, where phi is the share of the free board the
+  player reaches before every opponent (0 when its round ends). It gives a dense
+  signal for claiming and cutting off space without changing the optimal policy.
+  That share is computed on a 64x64 grid with an 8-connected search, so that trail
+  holes count as passages.
 
 ```bash
 # GPU server (recommended): CNN over the egocentric map, larger network
@@ -168,19 +183,35 @@ plain text, flushed line by line, and is also appended to `runs/<run-name>/train
 so it works the same in a terminal or in a Slurm `sbatch` output file.
 
 Sample videos: every `--video-every` updates (default: at each evaluation) the
-trainer plays one round with all bonuses on (`--video-players`, default 6; the other
-avatars are the bot itself or the heuristic, `--video-opponent`) and saves it as an
-animated GIF, both in `runs/<run-name>/videos/` and in tensorboard (Images tab,
-`video/sample_round`, with a slider over training steps). The bot being followed
-has a white ring; bonus rings are green (affect the catcher), red (affect enemies)
-or blue (whole game), and the border turns dashed blue in borderless mode.
+trainer plays one round with all bonuses on (`--video-players`, default 6) and
+saves it as an animated GIF, both in `runs/<run-name>/videos/` and in tensorboard
+(Images tab, `video/sample_round`, with a slider over training steps). By default
+(`--video-opponent mixed`) the round is composed like a mixed training round, plus
+an exploiter; `self`, `heuristic` and `human` fill the other slots with one kind.
+Each head shows its player kind: **B** bot being trained, **E** exploiter, **L**
+lookahead heuristic, **P** past version, **H** human-like. The bot being followed
+has a white ring. Bonuses use the game's own icons (`curvysim/assets/bonus.png`,
+from Curvytron under its MIT license): green affects the catcher, red its enemies,
+grey everybody; a legend beside the board names them and the letters. The border
+turns dashed blue in borderless mode. Frames are 400 px (plus the legend), about
+2-3 MB per GIF.
 
 Outputs go to `runs/<run-name>/`: `model_latest.pt`, a checkpoint per evaluation in
 `pool/`, and tensorboard logs. The evaluations play against the lookahead
 heuristic in 2, 4 and 8 player rounds (`eval/win_heur_*`: rate of surviving the
 round, `eval/ret_heur_*`: mean round return, 0 = average placement) and against an
-older snapshot in 6 player rounds. `--resume` continues from a checkpoint (e.g.
+older snapshot in 6 player rounds. `--resume` starts a new run from a policy (e.g.
 to fine-tune with a different `--delay` or player mix).
+
+Every `--checkpoint-every` updates (default 25) the run also writes a full
+checkpoint, `state.pt`: weights and optimizer state of the main agent and the
+exploiters, the opponent pool, step counters, best score, recent stats and random
+generator states. Starting a run whose directory has a `state.pt` resumes from it
+(the same command works for a fresh start and a restart), and tensorboard drops the
+points logged after the checkpoint. On SIGTERM (preemption, `scancel`, time limit)
+the run checkpoints and exits at the next safe point. Only the rounds in progress
+and the updates since the last checkpoint are lost. `jobs/train_bot.job` uses this
+to run as a preemptable, requeued SLURM job.
 
 ```bash
 uv run python evaluate.py --model runs/big/model_latest.pt --players 8              # vs heuristic
