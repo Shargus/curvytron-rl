@@ -135,7 +135,8 @@ Three additions push the bot away from simply circling in a safe corner:
 - **League exploiters** (`--exploiters`, default 2; `--p-exploit`, default 20% of
   rounds). An exploiter is a copy of the main agent that trains only in rounds
   against the current main agent, taking one slot (up to a third of the slots in
-  big rounds) with a higher aggression (`--exploiter-kill-reward`, default 0.6-1.2).
+  big rounds) with a higher aggression (`--exploiter-kill-reward`, default 0.6-1:
+  the top of the main agent's range, which it has seen as an input).
   Once its placement score against the main agent reaches `--exploiter-target`
   (default 0.65), or after `--exploiter-max-age` updates, a frozen copy joins the
   opponent pool and the exploiter restarts from the latest main agent.

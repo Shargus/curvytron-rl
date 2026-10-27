@@ -102,7 +102,8 @@ def parse_args():
     p.add_argument('--exploiters', type=int, default=2, help='league exploiters trained alongside (0 = off)')
     p.add_argument('--p-exploit', type=float, default=0.2,
                    help='share of rounds with an exploiter (--p-selfplay applies to the rest)')
-    p.add_argument('--exploiter-kill-reward', default='0.6,1.2', help='aggression range of exploiters')
+    p.add_argument('--exploiter-kill-reward', default='0.6,1',
+                   help='aggression range of exploiters (keep it within --kill-reward: the input is observed)')
     p.add_argument('--exploiter-target', type=float, default=0.65,
                    help='placement score vs the main agent at which an exploiter joins the pool and restarts')
     p.add_argument('--exploiter-min-age', type=int, default=50, help='updates before an exploiter can graduate')
